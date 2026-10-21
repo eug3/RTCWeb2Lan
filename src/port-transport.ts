@@ -23,14 +23,26 @@ export class PortOverlayTransport implements OverlayTransport {
   private readonly pending = new Map<number, Pending>();
   private ready = false;
   private readyWaiter: (() => void) | null = null;
+  private closed = false;
+  /** Invoked when the page holding the peer connection goes away. */
+  onClose: (() => void) | null = null;
 
   constructor(private readonly port: MessagePort) {
     port.onmessage = (event: MessageEvent) => this.onMessage(event.data);
+    // MessagePort#onclose is not in every TS DOM lib but works in Chromium;
+    // where it is missing, exchanges simply keep timing out (previous behavior).
+    type CloseablePort = MessagePort & { onclose: ((this: MessagePort, ev: Event) => void) | null };
+    (this.port as CloseablePort).onclose = () => {
+      if (this.closed) return;
+      this.closed = true;
+      this.dispose();
+      this.onClose?.();
+    };
     port.start();
   }
 
   get isReady(): boolean {
-    return this.ready;
+    return !this.closed && this.ready;
   }
 
   waitReady(timeoutMs?: number): Promise<void> {
@@ -84,6 +96,7 @@ export class PortOverlayTransport implements OverlayTransport {
   }
 
   dispose(): void {
+    this.closed = true;
     for (const op of this.pending.values()) {
       op.reject(new Error("data plane disposed"));
     }

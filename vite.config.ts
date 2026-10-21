@@ -40,7 +40,12 @@ export default defineConfig({
   ],
   build: {
     rollupOptions: {
-      input: { main: "index.html", sw: "src/sw.ts" },
+      input: {
+        main: "index.html",
+        connect: "connect.html",
+        holder: "holder.html",
+        sw: "src/sw.ts",
+      },
       output: {
         entryFileNames: (chunk) =>
           chunk.name === "sw" ? "sw.js" : "assets/[name]-[hash].js",

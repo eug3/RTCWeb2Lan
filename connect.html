@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>正在打通链路…</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; }
+      body {
+        margin: 0;
+        font: 15px/1.6 -apple-system, "SF Pro Text", system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+        background: radial-gradient(1200px 600px at 50% -10%, #1b2130 0%, #0d1017 60%, #090b10 100%);
+        color: #e8ecf3;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        padding: 24px;
+      }
+      .wrap { width: min(560px, 100%); text-align: center; }
+      h1 { font-size: 21px; margin: 18px 0 4px; letter-spacing: .5px; }
+      .sub { color: #98a2b8; font-size: 13.5px; margin: 0 0 6px; }
+      #stage { font-size: 15px; color: #ffd166; min-height: 24px; font-weight: 600; }
+      #attempt { font-size: 12.5px; color: #7d8798; min-height: 18px; }
+      #failbox { display: none; margin-top: 14px; }
+      #reason { color: #ff9f8a; font-size: 12.5px; margin-bottom: 12px; word-break: break-all; }
+      button {
+        font: inherit; padding: 8px 18px; border-radius: 9px; cursor: pointer;
+        border: 1px solid #3a4356; background: #1d2433; color: #e8ecf3; margin: 0 6px;
+      }
+      button:hover { background: #273043; }
+      button.primary { background: #2f6f4f; border-color: #3d8a63; }
+      button.primary:hover { background: #38845e; }
+      .diag { margin-top: 18px; font-size: 12px; }
+      .diag a { color: #5f6b80; text-decoration: none; }
+      .diag a:hover { color: #98a2b8; }
+
+      /* ---- the welding monster ---- */
+      .scene { width: min(420px, 92vw); height: auto; display: block; margin: 0 auto; }
+
+      .monster { animation: bob 2.2s ease-in-out infinite; transform-origin: 210px 240px; }
+      @keyframes bob { 0%,100% { transform: translateY(0); } 50% { transform: translateY(3px); } }
+
+      .arm-right { animation: weld 1.4s ease-in-out infinite; transform-origin: 246px 186px; }
+      @keyframes weld { 0%,100% { transform: rotate(0deg); } 45% { transform: rotate(-7deg); } 60% { transform: rotate(3deg); } }
+
+      .flame { animation: flicker 0.18s steps(2, jump-none) infinite; transform-origin: 228px 122px; }
+      @keyframes flicker { 0% { transform: scale(1, 1); opacity: .95; } 100% { transform: scale(1.15, .9); opacity: .8; } }
+
+      .glow { animation: pulse 1.1s ease-in-out infinite; transform-origin: 210px 100px; }
+      @keyframes pulse { 0%,100% { transform: scale(1); opacity: .9; } 50% { transform: scale(1.25); opacity: .6; } }
+
+      .spark { opacity: 0; animation: fly 0.9s ease-out infinite; }
+      .spark:nth-of-type(2) { animation-delay: .15s; }
+      .spark:nth-of-type(3) { animation-delay: .3s; }
+      .spark:nth-of-type(4) { animation-delay: .45s; }
+      .spark:nth-of-type(5) { animation-delay: .6s; }
+      .spark:nth-of-type(6) { animation-delay: .25s; }
+      .spark:nth-of-type(7) { animation-delay: .5s; }
+      .spark:nth-of-type(8) { animation-delay: .7s; }
+      @keyframes fly {
+        0% { transform: translate(0, 0) scale(1); opacity: 1; }
+        70% { opacity: .9; }
+        100% { transform: translate(var(--dx), var(--dy)) scale(.2); opacity: 0; }
+      }
+
+      .chain-l { animation: trembleL 1.4s ease-in-out infinite; }
+      .chain-r { animation: trembleR 1.4s ease-in-out infinite; }
+      @keyframes trembleL { 0%,100% { transform: translateX(0); } 50% { transform: translateX(2px); } }
+      @keyframes trembleR { 0%,100% { transform: translateX(0); } 50% { transform: translateX(-2px); } }
+
+      .weld-link { stroke-dasharray: 70; stroke-dashoffset: 70; }
+      .visor { animation: visorGlow 2s ease-in-out infinite; }
+      @keyframes visorGlow { 0%,100% { opacity: .85; } 50% { opacity: 1; } }
+
+      /* ---- success ---- */
+      .scene.done .spark, .scene.done .flame, .scene.done .glow-core { display: none; }
+      .scene.done .glow { display: none; }
+      .scene.done .weld-link {
+        animation: drawLink .45s ease-out forwards;
+        stroke: #46d78a; filter: drop-shadow(0 0 6px #46d78a);
+      }
+      @keyframes drawLink { to { stroke-dashoffset: 0; } }
+      .scene.done .chain-l { animation: clankL .3s ease-out 1; }
+      .scene.done .chain-r { animation: clankR .3s ease-out 1; }
+      @keyframes clankL { 0% { transform: translateX(6px); } 100% { transform: translateX(0); } }
+      @keyframes clankR { 0% { transform: translateX(-6px); } 100% { transform: translateX(0); } }
+      .scene.done .monster { animation: cheer .6s ease-out 1; }
+      @keyframes cheer { 0% { transform: translateY(0); } 35% { transform: translateY(-14px); } 65% { transform: translateY(0); } 85% { transform: translateY(-5px); } 100% { transform: translateY(0); } }
+      .scene.done .visor { fill: #46d78a; animation: none; }
+
+      @media (prefers-reduced-motion: reduce) {
+        .monster, .arm-right, .flame, .glow, .spark, .chain-l, .chain-r, .visor { animation: none !important; }
+        .spark { display: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <svg class="scene" id="scene" viewBox="0 0 420 280" role="img" aria-label="一只小怪兽正在焊接两条铁链">
+        <defs>
+          <radialGradient id="g-weld" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stop-color="#fff8e1" stop-opacity="1" />
+            <stop offset="35%" stop-color="#ffc94d" stop-opacity=".85" />
+            <stop offset="100%" stop-color="#ff8a00" stop-opacity="0" />
+          </radialGradient>
+          <radialGradient id="g-body" cx="40%" cy="30%" r="90%">
+            <stop offset="0%" stop-color="#79d98f" />
+            <stop offset="100%" stop-color="#3fa161" />
+          </radialGradient>
+          <linearGradient id="g-metal" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#aeb8c9" />
+            <stop offset="100%" stop-color="#77839a" />
+          </linearGradient>
+        </defs>
+
+        <!-- floor shadow -->
+        <ellipse cx="210" cy="252" rx="120" ry="12" fill="#000" opacity=".35" />
+
+        <!-- left chain -->
+        <g class="chain-l" stroke="url(#g-metal)" stroke-width="6" fill="none">
+          <ellipse cx="24"  cy="100" rx="16" ry="10" />
+          <ellipse cx="50"  cy="103" rx="16" ry="10" />
+          <ellipse cx="76"  cy="100" rx="16" ry="10" />
+          <ellipse cx="102" cy="103" rx="16" ry="10" />
+          <ellipse cx="128" cy="100" rx="16" ry="10" />
+          <ellipse cx="154" cy="103" rx="16" ry="10" />
+          <ellipse cx="180" cy="100" rx="16" ry="10" />
+        </g>
+        <!-- right chain -->
+        <g class="chain-r" stroke="url(#g-metal)" stroke-width="6" fill="none">
+          <ellipse cx="240" cy="100" rx="16" ry="10" />
+          <ellipse cx="266" cy="103" rx="16" ry="10" />
+          <ellipse cx="292" cy="100" rx="16" ry="10" />
+          <ellipse cx="318" cy="103" rx="16" ry="10" />
+          <ellipse cx="344" cy="100" rx="16" ry="10" />
+          <ellipse cx="370" cy="103" rx="16" ry="10" />
+          <ellipse cx="396" cy="100" rx="16" ry="10" />
+        </g>
+        <!-- the link being welded (drawn on success) -->
+        <ellipse class="weld-link" cx="210" cy="100" rx="15" ry="9" fill="none" stroke="#ffc94d" stroke-width="6" />
+
+        <!-- weld glow -->
+        <g class="glow">
+          <circle class="glow-core" cx="210" cy="100" r="26" fill="url(#g-weld)" />
+        </g>
+
+        <!-- sparks -->
+        <g fill="#ffd166">
+          <circle class="spark" cx="210" cy="100" r="2.4" style="--dx:-34px; --dy:-26px" />
+          <circle class="spark" cx="210" cy="100" r="1.8" style="--dx: 30px; --dy:-30px" fill="#ff9d3c" />
+          <circle class="spark" cx="210" cy="100" r="2.0" style="--dx: 40px; --dy: -8px" />
+          <circle class="spark" cx="210" cy="100" r="1.6" style="--dx:-42px; --dy:  6px" fill="#fff3c4" />
+          <circle class="spark" cx="210" cy="100" r="2.2" style="--dx: 16px; --dy:-40px" fill="#ff9d3c" />
+          <circle class="spark" cx="210" cy="100" r="1.7" style="--dx:-18px; --dy:-44px" fill="#fff3c4" />
+          <circle class="spark" cx="210" cy="100" r="1.9" style="--dx: 44px; --dy:-18px" fill="#ff9d3c" />
+          <circle class="spark" cx="210" cy="100" r="1.5" style="--dx:-38px; --dy:-14px" />
+        </g>
+
+        <!-- the monster -->
+        <g class="monster">
+          <!-- legs -->
+          <rect x="186" y="234" width="16" height="18" rx="7" fill="#2f7d4c" />
+          <rect x="218" y="234" width="16" height="18" rx="7" fill="#2f7d4c" />
+          <!-- body -->
+          <ellipse cx="210" cy="204" rx="52" ry="42" fill="url(#g-body)" />
+          <!-- belly patch -->
+          <ellipse cx="210" cy="216" rx="30" ry="20" fill="#a7ecc0" opacity=".45" />
+          <!-- horns -->
+          <path d="M178 172 l-8 -14 l16 6 Z" fill="#ffd166" />
+          <path d="M242 172 l8 -14 l-16 6 Z" fill="#ffd166" />
+          <!-- welding mask -->
+          <rect x="170" y="176" width="80" height="30" rx="13" fill="#2b303c" />
+          <rect x="179" y="185" width="62" height="11" rx="5.5" class="visor" fill="#ffb020" />
+          <line x1="170" y1="184" x2="160" y2="192" stroke="#2b303c" stroke-width="5" stroke-linecap="round" />
+          <line x1="250" y1="184" x2="260" y2="192" stroke="#2b303c" stroke-width="5" stroke-linecap="round" />
+          <!-- mouth -->
+          <path d="M196 224 Q 210 234 224 224" stroke="#1c5c38" stroke-width="4" fill="none" stroke-linecap="round" />
+          <!-- left arm bracing -->
+          <path d="M160 206 Q 140 214 134 200" stroke="#3fa161" stroke-width="13" fill="none" stroke-linecap="round" />
+          <!-- right arm + torch -->
+          <g class="arm-right">
+            <path d="M258 200 Q 252 168 240 146" stroke="#3fa161" stroke-width="13" fill="none" stroke-linecap="round" />
+            <g transform="rotate(24 240 146)">
+              <rect x="231" y="138" width="26" height="9" rx="3" fill="#3a4152" />
+              <polygon class="flame" points="231,142 212,138 216,146 210,150 231,147" fill="#7fd4ff" />
+            </g>
+          </g>
+        </g>
+      </svg>
+
+      <h1 id="title">正在打通内网链路</h1>
+      <p class="sub">小怪兽正在焊接两条铁链：浏览器 ⇋ 内网</p>
+      <div id="stage">准备中…</div>
+      <div id="attempt"></div>
+
+      <div id="failbox">
+        <div id="reason"></div>
+        <button class="primary" id="btn-retry">再试一次</button>
+        <button id="btn-enter">直接进入（经反代）</button>
+      </div>
+
+      <div class="diag"><a id="diag-link" href="#">打开诊断页 →</a></div>
+    </div>
+
+    <script type="module" src="/src/connect.ts"></script>
+  </body>
+</html>

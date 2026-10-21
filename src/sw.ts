@@ -12,8 +12,28 @@ import { encodeRequest, parseResponse } from "./http1.js";
 import { withTimeout, type OverlayTransport } from "./transport.js";
 import { createMockTransport } from "./mock-transport.js";
 import { PortOverlayTransport } from "./port-transport.js";
+import {
+  decideNavigation,
+  injectHolderIntoHtml,
+  REWRITTEN_HTML_DROP_HEADERS,
+} from "./nav-gate.js";
 
 declare const self: ServiceWorkerGlobalScope;
+
+/** Resolve a shipped page URL next to the SW script.
+ *
+ * Production ships everything in one directory (e.g. /__lan/); in vite dev the
+ * SW is served from /src/sw.ts while the HTML entries live at the root.
+ */
+function pageUrl(name: string): URL {
+  const base = self.location.pathname.includes("/src/")
+    ? new URL("/", self.location.href)
+    : new URL("./", self.location.href);
+  return new URL(name, base);
+}
+
+const CONNECT_URL = pageUrl("connect.html");
+const HOLDER_URL = pageUrl("holder.html");
 
 export interface OverlayConfig {
   rules: RouteRule[];
@@ -37,6 +57,9 @@ const DEFAULT_RULES: RouteRule[] = [
 
 let config: OverlayConfig = { rules: DEFAULT_RULES, exchangeTimeoutMs: 120_000 };
 
+/** Last signaling endpoint a page used, so injected holders reconnect the same way. */
+let endpoint: { signalUrl: string; room: string; stun: string } | null = null;
+
 /**
  * Master switch for interception.
  *
@@ -58,7 +81,38 @@ function getTransport(): OverlayTransport {
 function attachDataPlanePort(port: MessagePort): void {
   portTransport?.dispose();
   portTransport = new PortOverlayTransport(port);
+  portTransport.onClose = () => {
+    // The page holding the peer connection went away: stop intercepting at
+    // once (fallback to nginx) and ask a surviving holder to reconnect.
+    overlayEnabled = false;
+    void notifyOverlayDown();
+  };
   transport = portTransport;
+}
+
+async function notifyOverlayDown(): Promise<void> {
+  const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  for (const client of clients) {
+    client.postMessage({ type: "overlay:down" });
+  }
+}
+
+function holderUrl(): string {
+  if (!endpoint) return HOLDER_URL.href;
+  const url = new URL(HOLDER_URL.href);
+  url.searchParams.set("signal", endpoint.signalUrl);
+  url.searchParams.set("room", endpoint.room);
+  if (endpoint.stun) url.searchParams.set("stun", endpoint.stun);
+  return url.href;
+}
+
+function connectUrl(): string {
+  if (!endpoint) return CONNECT_URL.href;
+  const url = new URL(CONNECT_URL.href);
+  url.searchParams.set("signal", endpoint.signalUrl);
+  url.searchParams.set("room", endpoint.room);
+  if (endpoint.stun) url.searchParams.set("stun", endpoint.stun);
+  return url.href;
 }
 
 self.addEventListener("install", (event: ExtendableEvent) => {
@@ -70,7 +124,15 @@ self.addEventListener("activate", (event: ExtendableEvent) => {
 });
 
 self.addEventListener("message", (event: ExtendableMessageEvent) => {
-  const data = event.data as { type?: string; config?: Partial<OverlayConfig> } | undefined;
+  const data = event.data as
+    | {
+        type?: string;
+        config?: Partial<OverlayConfig>;
+        signalUrl?: string;
+        room?: string;
+        stun?: string;
+      }
+    | undefined;
 
   if (data?.type === "overlay:configure" && data.config) {
     config = { ...config, ...data.config };
@@ -78,6 +140,12 @@ self.addEventListener("message", (event: ExtendableMessageEvent) => {
       apiPrefixes = data.config.apiPrefixes;
     }
     event.source?.postMessage({ type: "overlay:configured", rules: config.rules });
+    return;
+  }
+
+  if (data?.type === "overlay:set-endpoint" && data.signalUrl && data.room) {
+    endpoint = { signalUrl: data.signalUrl, room: data.room, stun: data.stun ?? "" };
+    event.source?.postMessage({ type: "overlay:endpoint-set" });
     return;
   }
 
@@ -97,7 +165,11 @@ self.addEventListener("message", (event: ExtendableMessageEvent) => {
   }
 
   if (data?.type === "overlay:status") {
-    event.source?.postMessage({ type: "overlay:status-reply", enabled: overlayEnabled });
+    event.source?.postMessage({
+      type: "overlay:status-reply",
+      enabled: overlayEnabled,
+      hasTransport: portTransport !== null && portTransport.isReady,
+    });
     return;
   }
 
@@ -128,18 +200,74 @@ function shouldTunnel(pathname: string): boolean {
 }
 
 self.addEventListener("fetch", (event: FetchEvent) => {
+  const url = new URL(event.request.url);
+  // Never hijack our own control pages or the signalling socket.
+  if (url.pathname.startsWith("/__lan")) return;
+
+  // Splash gate: a cold visit to the site root shows the connecting page;
+  // once the tunnel is up, the root HTML gets a hidden holder iframe that
+  // keeps the data plane alive for the lifetime of the tab.
+  if (event.request.mode === "navigate") {
+    const decision = decideNavigation({
+      pathname: url.pathname,
+      enabled: overlayEnabled,
+      cookieHeader: event.request.headers.get("cookie"),
+    });
+
+    if (decision === "connect-page") {
+      event.respondWith(Response.redirect(connectUrl(), 302));
+      return;
+    }
+    if (decision === "inject-holder") {
+      event.respondWith(fetchWithHolder(event.request));
+      return;
+    }
+    return; // passthrough
+  }
+
   // Pass everything through until the page confirms a live P2P link.
   if (!overlayEnabled) return;
-
-  const url = new URL(event.request.url);
-  // Never hijack our own control page or the signalling socket.
-  if (url.pathname.startsWith("/__lan")) return;
   if (!shouldTunnel(url.pathname)) return;
 
   const route = resolveRoute(url.hostname, url.pathname, url.search, config.rules);
   if (route === null) return;
   event.respondWith(tunnel(event.request, route));
 });
+
+/** Fetch the real document and plant the holder iframe before </body>. */
+async function fetchWithHolder(request: Request): Promise<Response> {
+  // fetch() rejects Request objects whose mode is "navigate"; rebuild it as a
+  // plain same-origin GET (navigations are always GET).
+  const reqHeaders = new Headers();
+  for (const name of ["accept", "accept-language"]) {
+    const value = request.headers.get(name);
+    if (value) reqHeaders.set(name, value);
+  }
+  const upstream = new Request(request.url, {
+    method: "GET",
+    headers: reqHeaders,
+    credentials: "same-origin",
+    redirect: "follow",
+  });
+
+  const response = await fetch(upstream);
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.includes("text/html")) return response;
+
+  const html = await response.text();
+  const injected = injectHolderIntoHtml(html, holderUrl());
+  if (injected === null) return response;
+
+  const headers = new Headers();
+  response.headers.forEach((value, name) => {
+    if (!REWRITTEN_HTML_DROP_HEADERS.has(name.toLowerCase())) headers.set(name, value);
+  });
+  return new Response(injected, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
 
 async function tunnel(
   request: Request,

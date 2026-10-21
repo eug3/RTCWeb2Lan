@@ -28,12 +28,18 @@ export function attachDataPlane(
   instance: OverlayInstanceLike,
   options: DataPlaneOptions = {},
 ): () => void {
-  const timeoutMs = options.exchangeTimeoutMs ?? DEFAULT_EXCHANGE_TIMEOUT_MS;
+  const exchangeTimeoutMs = options.exchangeTimeoutMs ?? DEFAULT_EXCHANGE_TIMEOUT_MS;
   let disposed = false;
 
   const post = (msg: unknown) => {
     if (!disposed) port.postMessage(msg);
   };
+
+  // Concurrent exchanges on one peer connection intermittently wedge
+  // (one channel's transfer stalls the others in the SCTP layer). Requests are
+  // seconds apart in practice, so a serial queue costs nothing and removes the
+  // failure mode entirely.
+  let queue: Promise<void> = Promise.resolve();
 
   port.onmessage = (event: MessageEvent) => {
     const msg = event.data as Record<string, unknown> | null;
@@ -43,13 +49,17 @@ export function attachDataPlane(
     const authority = String(msg.authority);
     const requestBytes = new Uint8Array(msg.bytes as ArrayBuffer);
 
-    void runExchange(instance, requestBytes, timeoutMs)
-      .then((bytes) => {
-        post({ t: "result", id, bytes: bytes.buffer });
-      })
-      .catch((error: unknown) => {
-        post({ t: "error", id, message: error instanceof Error ? error.message : String(error) });
-      });
+    queue = queue.then(() =>
+      disposed
+        ? undefined
+        : runExchange(instance, requestBytes, exchangeTimeoutMs)
+            .then((bytes) => {
+              post({ t: "result", id, bytes: bytes.buffer });
+            })
+            .catch((error: unknown) => {
+              post({ t: "error", id, message: error instanceof Error ? error.message : String(error) });
+            }),
+    );
 
     void authority;
   };
