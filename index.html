@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EasyTier Web2Lan — Browser Overlay</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font: 14px/1.65 -apple-system, "SF Pro Text", system-ui, "PingFang SC", sans-serif;
+        max-width: 980px; margin: 32px auto; padding: 0 20px; color: #1d1d1f;
+      }
+      h1 { font-size: 22px; margin-bottom: 4px; }
+      .sub { color: #6e6e73; margin-top: 0; }
+      .card { border: 1px solid #e5e5ea; border-radius: 10px; padding: 16px 18px; margin: 14px 0; }
+      .card h2 { font-size: 15px; margin: 0 0 10px; }
+      .row { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+      .status { font-weight: 600; }
+      .ok { color: #1a7f37; }
+      .bad { color: #cf222e; }
+      .idle { color: #6e6e73; }
+      button { font: inherit; padding: 6px 14px; border-radius: 7px; border: 1px solid #d2d2d7;
+               background: #fff; cursor: pointer; }
+      button:hover:not(:disabled) { background: #f5f5f7; }
+      button:disabled { opacity: .45; cursor: not-allowed; }
+      pre { background: #f5f5f7; padding: 12px; border-radius: 8px; overflow-x: auto;
+            white-space: pre-wrap; word-break: break-all; font-size: 12.5px; margin: 0; }
+      code { background: #f5f5f7; padding: 1px 5px; border-radius: 5px; font-size: 12.5px; }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid #f0f0f2; }
+      th { color: #6e6e73; font-weight: 500; }
+      .note { color: #6e6e73; font-size: 12.5px; }
+      .warn { color: #9a6700; }
+    </style>
+  </head>
+  <body>
+    <h1>EasyTier Web2Lan</h1>
+    <p class="sub">浏览器通过 P2P 访问内网 web，地址栏 URL 全程不变。</p>
+
+    <div class="card">
+      <h2>1 · 链路状态</h2>
+      <table>
+        <tr><th style="width:180px">环节</th><th>状态</th></tr>
+        <tr><td>Service Worker</td><td><span id="sw-status" class="status idle">未注册</span></td></tr>
+        <tr><td>数据面（MessagePort）</td><td><span id="dp-status" class="status idle">未接入</span></td></tr>
+        <tr><td>WebRTC 连接</td><td><span id="rtc-status" class="status idle">未建立</span></td></tr>
+        <tr><td>数据路径</td><td><span id="data-path" class="status idle">未确定</span></td></tr>
+      </table>
+      <div style="margin-top:12px; display:grid; grid-template-columns:110px 1fr; gap:8px 12px; align-items:center;">
+        <label for="in-signal" class="note">信令地址</label>
+        <input id="in-signal" value="ws://127.0.0.1:8787/ws" style="font:inherit; padding:5px 9px; border:1px solid #d2d2d7; border-radius:6px;" />
+        <label for="in-room" class="note">房间号</label>
+        <input id="in-room" value="demo" style="font:inherit; padding:5px 9px; border:1px solid #d2d2d7; border-radius:6px;" />
+        <label for="in-stun" class="note">STUN（可留空）</label>
+        <input id="in-stun" value="" placeholder="stun:stun.chat.bilibili.com:3478" style="font:inherit; padding:5px 9px; border:1px solid #d2d2d7; border-radius:6px;" />
+      </div>
+      <div id="warn" class="note warn" style="margin-top:10px;"></div>
+      <div class="row" style="margin-top:12px; margin-bottom:0;">
+        <button id="btn-connect">建立 WebRTC 连接</button>
+        <span class="note">连上后，下面的请求会经 P2P 发到内网 Agent。</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>2 · 发起请求</h2>
+      <p class="note">
+        路由规则：<code>127.0.0.1/tunnel/154/*</code> → <code>10.1.1.154:80</code>。
+        注意下方「响应 URL」始终与请求路径一致，不含内网 IP。
+      </p>
+      <div class="row">
+        <button id="btn-api">GET /tunnel/154/api/ping</button>
+        <button id="btn-page">GET /tunnel/154/page</button>
+        <button id="btn-pass">GET /package.json（应原样放行）</button>
+        <button id="btn-img">GET /tunnel/154/logo.png（图片）</button>
+      </div>
+      <pre id="out">点击上方按钮发起请求。</pre>
+    </div>
+
+    <div class="card">
+      <h2>3 · 关键约束验证</h2>
+      <table>
+        <tr><th style="width:180px">检查项</th><th>结果</th></tr>
+        <tr><td>当前地址栏</td><td><code id="loc"></code></td></tr>
+        <tr><td>上次响应 URL</td><td><code id="res-url">—</code></td></tr>
+        <tr><td>响应 URL 是否泄露内网 IP</td><td><span id="leak" class="status idle">—</span></td></tr>
+      </table>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
