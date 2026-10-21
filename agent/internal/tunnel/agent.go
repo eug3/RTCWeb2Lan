@@ -8,6 +8,7 @@ package tunnel
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 )
@@ -149,7 +151,15 @@ func (a *Agent) serveChannel(dc *webrtc.DataChannel) {
 		}
 	})
 
+	// A wedged SCTP stream opens the channel but never delivers the request
+	// bytes; without a deadline the browser-side retry (fresh channel) could
+	// never take over because this read would block forever.
+	readTimer := time.AfterFunc(15*time.Second, func() {
+		_ = writer.CloseWithError(errors.New("request read timeout"))
+		_ = dc.Close()
+	})
 	req, err := http.ReadRequest(bufio.NewReader(reader))
+	readTimer.Stop()
 	if err != nil {
 		a.log.Printf("read request: %v", err)
 		return

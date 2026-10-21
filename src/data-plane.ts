@@ -72,18 +72,29 @@ export function attachDataPlane(
   };
 }
 
+/** First attempt gets a short grace: a wedged SCTP stream never delivers, and
+ * retrying once on a fresh channel recovers without waiting for the full
+ * exchange timeout. */
+const FIRST_ATTEMPT_GRACE_MS = 6_000;
+
 async function runExchange(
   instance: OverlayInstanceLike,
   requestBytes: Uint8Array,
   timeoutMs: number,
 ): Promise<Uint8Array> {
-  const channel = instance.openChannel();
-  const sender = createChannelSender(channel);
-  try {
-    await sender.sendAll(requestBytes);
-    return await sender.receiveAll(timeoutMs);
-  } finally {
-    sender.close();
+  for (let attempt = 1; ; attempt++) {
+    const channel = instance.openChannel();
+    const sender = createChannelSender(channel);
+    try {
+      await sender.sendAll(requestBytes);
+      const budget = attempt === 1 && timeoutMs > FIRST_ATTEMPT_GRACE_MS ? FIRST_ATTEMPT_GRACE_MS : timeoutMs;
+      return await sender.receiveAll(budget);
+    } catch (error) {
+      if (attempt >= 2 || timeoutMs <= FIRST_ATTEMPT_GRACE_MS) throw error;
+      // fall through: retry once on a fresh channel
+    } finally {
+      sender.close();
+    }
   }
 }
 

@@ -141,11 +141,12 @@ export async function connectAsInitiator(opts: {
   await withTimeout(answered, timeout, "answer");
   await waitConnected(pc, timeout);
 
-  return makeHandle(pc, () => localType, () => remoteType, session, signaling, () => {
-    const ch = primaryChannel;
-    primaryChannel = null;
-    return ch;
-  });
+  // The pre-offer channel exists only so the SDP gains an m-line; handing it
+  // out for the first exchange proved unreliable (its SCTP stream sometimes
+  // never delivers, agent-side the channel opens but no bytes arrive). Every
+  // request opens a fresh channel on the established connection instead.
+  primaryChannel = null;
+  return makeHandle(pc, () => localType, () => remoteType, session, signaling);
 }
 
 /**

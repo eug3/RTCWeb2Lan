@@ -18,6 +18,9 @@ interface Pending {
   reject: (error: Error) => void;
 }
 
+/** Hard cap for one exchange when the owning page died silently. */
+const DEAD_PORT_TIMEOUT_MS = 25_000;
+
 export class PortOverlayTransport implements OverlayTransport {
   private nextId = 1;
   private readonly pending = new Map<number, Pending>();
@@ -87,7 +90,16 @@ export class PortOverlayTransport implements OverlayTransport {
     const id = this.nextId++;
     const copy = requestBytes.slice();
     return new Promise<Uint8Array>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      // A page that died without the port close event firing would otherwise
+      // leave every exchange pending forever; reject so callers can react.
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error("data plane exchange timed out"));
+      }, DEAD_PORT_TIMEOUT_MS);
+      this.pending.set(id, {
+        resolve: (bytes: Uint8Array) => { clearTimeout(timer); resolve(bytes); },
+        reject: (err: Error) => { clearTimeout(timer); reject(err); },
+      });
       this.port.postMessage(
         { t: "exchange", id, authority, bytes: copy.buffer },
         [copy.buffer],

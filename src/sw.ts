@@ -17,6 +17,7 @@ import {
   injectHolderIntoHtml,
   REWRITTEN_HTML_DROP_HEADERS,
 } from "./nav-gate.js";
+import { extractSetCookies } from "./cookie-relay.js";
 
 declare const self: ServiceWorkerGlobalScope;
 
@@ -55,7 +56,10 @@ const DEFAULT_RULES: RouteRule[] = [
   { kind: "prefix", host: "localhost", prefix: "/tunnel/154", target: { ipv4: "10.1.1.154", port: 80 } },
 ];
 
-let config: OverlayConfig = { rules: DEFAULT_RULES, exchangeTimeoutMs: 120_000 };
+// Generous because it also covers the data plane's serial exchange queue during
+// SPA boot bursts; true port death is detected faster by PortOverlayTransport's
+// own internal timeout.
+let config: OverlayConfig = { rules: DEFAULT_RULES, exchangeTimeoutMs: 45_000 };
 
 /** Last signaling endpoint a page used, so injected holders reconnect the same way. */
 let endpoint: { signalUrl: string; room: string; stun: string } | null = null;
@@ -88,6 +92,21 @@ function attachDataPlanePort(port: MessagePort): void {
     void notifyOverlayDown();
   };
   transport = portTransport;
+}
+
+/**
+ * A failed exchange almost always means the data plane is dead (the page that
+ * owned the peer connection went away and the port close event never fired).
+ * Failing every request for 120s each would wedge the SPA on boot; instead
+ * drop the overlay immediately so requests fall back to nginx while the holder
+ * reconnects.
+ */
+function dropDeadTransport(): void {
+  overlayEnabled = false;
+  portTransport?.dispose();
+  portTransport = null;
+  transport = null;
+  void notifyOverlayDown();
 }
 
 async function notifyOverlayDown(): Promise<void> {
@@ -293,6 +312,7 @@ async function tunnel(
       "overlay exchange with " + route.authority,
     );
   } catch (error) {
+    dropDeadTransport();
     const message = error instanceof Error ? error.message : String(error);
     return textResponse(504, "overlay error: " + message);
   }
@@ -312,10 +332,25 @@ function textResponse(status: number, body: string): Response {
   return new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 }
 
-const DROPPED = new Set(["content-encoding", "content-length", "transfer-encoding", "connection", "keep-alive"]);
+const DROPPED = new Set(["content-encoding", "content-length", "transfer-encoding", "connection", "keep-alive", "set-cookie"]);
+
+/**
+ * Forward tunneled Set-Cookie headers to the window clients. The holder iframe
+ * assigns them via document.cookie so the browser shares the session with the
+ * nginx passthrough path (see src/cookie-relay.ts for why the SW cannot set
+ * them on the Response itself).
+ */
+async function relaySetCookies(cookies: string[]): Promise<void> {
+  if (cookies.length === 0) return;
+  const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  for (const client of clients) {
+    client.postMessage({ type: "w2l:set-cookie", cookies });
+  }
+}
 
 function toResponse(request: Request, parsed: ReturnType<typeof parseResponse>): Response {
   const headers = new Headers();
+  const setCookies = extractSetCookies(parsed.headers);
   for (const [name, value] of parsed.headers) {
     if (DROPPED.has(name.toLowerCase())) continue;
     try {
@@ -325,6 +360,7 @@ function toResponse(request: Request, parsed: ReturnType<typeof parseResponse>):
     }
   }
   const nullBody = request.method === "HEAD" || parsed.status === 204 || parsed.status === 304;
+  void relaySetCookies(setCookies);
   return new Response(nullBody ? null : (parsed.body as unknown as BodyInit), {
     status: parsed.status,
     statusText: parsed.statusText,

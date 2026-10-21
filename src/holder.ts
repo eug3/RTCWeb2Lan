@@ -22,6 +22,7 @@ import {
   rememberEndpoint,
   setOverlayEnabled,
 } from "./connect-flow.js";
+import { applySetCookies } from "./cookie-relay.js";
 import type { PeerConnectionHandle } from "./peer.js";
 
 const ASSET_BASE = (() => {
@@ -56,7 +57,9 @@ let deadSince = 0;
  */
 async function ensureConnected(): Promise<void> {
   const status = await queryOverlayStatus();
-  if (status.enabled) return; // the tunnel is served — stand down
+  // "enabled" alone can be a stale SW state (the owning page died without the
+  // port close event firing). Only a live transport means the tunnel is real.
+  if (status.enabled && status.hasTransport) return; // the tunnel is served — stand down
 
   if (peer) {
     // Orphaned peer (SW instance replaced): release it before reconnecting.
@@ -71,7 +74,7 @@ async function ensureConnected(): Promise<void> {
   await delay(300 + Math.random() * 1500);
 
   const recheck = await queryOverlayStatus();
-  if (recheck.enabled) {
+  if (recheck.enabled && recheck.hasTransport) {
     connecting = false;
     return;
   }
@@ -82,6 +85,7 @@ async function ensureConnected(): Promise<void> {
     peer = result.peer;
     backoffMs = 2000;
     deadSince = 0;
+    healthFailures = 0;
     log("tunnel up");
   } catch (error) {
     log("connect failed:", error instanceof Error ? error.message : String(error));
@@ -104,11 +108,13 @@ async function watchPeer(): Promise<void> {
     deadSince = 0;
     return;
   }
+  // "disconnected" is often a transient ICE flap (WiFi/EasyTier jitter); give
+  // it a generous grace before tearing the tunnel down.
   if (!deadSince) {
     deadSince = Date.now();
     return;
   }
-  if (Date.now() - deadSince < 4000) return; // brief ICE restarts are normal
+  if (Date.now() - deadSince < 15000) return;
 
   log("peer dead (" + state + "), releasing overlay");
   peer.close();
@@ -125,19 +131,28 @@ async function onOverlayDown(): Promise<void> {
   }
 }
 
+let healthFailures = 0;
+
 async function periodicHealthCheck(): Promise<void> {
   if (!peer) return;
   // Cheap liveness probe through the tunnel; a failing probe means the path
-  // is broken even though the PC object still looks fine.
-  const ok = await probeTunnel();
-  if (!ok) {
-    log("health probe failed");
-    if (peer) {
-      peer.close();
-      peer = null;
-    }
-    await setOverlayEnabled(false).catch(() => {});
+  // is broken even though the PC object still looks fine. Boot bursts queue
+  // exchanges, so a single slow probe is noise — only two in a row count.
+  const ok = await probeTunnel("/api/projects", 15000);
+  if (ok) {
+    healthFailures = 0;
+    return;
   }
+  healthFailures++;
+  log("health probe failed (" + healthFailures + "/2)");
+  if (healthFailures < 2) return;
+  healthFailures = 0;
+  log("tunnel dead, releasing overlay");
+  if (peer) {
+    peer.close();
+    peer = null;
+  }
+  await setOverlayEnabled(false).catch(() => {});
 }
 
 async function main(): Promise<void> {
@@ -147,8 +162,14 @@ async function main(): Promise<void> {
   await rememberEndpoint(endpoint);
 
   navigator.serviceWorker.addEventListener("message", (event: MessageEvent) => {
-    const d = event.data as { type?: string };
+    const d = event.data as { type?: string; cookies?: string[] };
     if (d?.type === "overlay:down") void onOverlayDown();
+    // Set-Cookie relay: the SW cannot set cookies on synthesized responses, so
+    // tunneled login cookies are assigned here (same-origin hidden iframe).
+    if (d?.type === "w2l:set-cookie" && Array.isArray(d.cookies)) {
+      const n = applySetCookies(d.cookies);
+      if (n > 0) log("relayed", n, "set-cookie header(s)");
+    }
   });
 
   setInterval(() => {
