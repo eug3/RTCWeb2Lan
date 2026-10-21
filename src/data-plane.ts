@@ -72,30 +72,44 @@ export function attachDataPlane(
   };
 }
 
-/** First attempt gets a short grace: a wedged SCTP stream never delivers, and
- * retrying once on a fresh channel recovers without waiting for the full
- * exchange timeout. */
-const FIRST_ATTEMPT_GRACE_MS = 6_000;
+/**
+ * Wedged SCTP streams open but never deliver a single byte. Detection is a
+ * short first-chunk budget (well above the LAN RTT); each attempt then retries
+ * on a fresh channel. Attempts are capped so a truly dead connection surfaces.
+ */
+const FIRST_CHUNK_BUDGET_MS = 2_000;
+const MAX_ATTEMPTS = 5;
 
 async function runExchange(
   instance: OverlayInstanceLike,
   requestBytes: Uint8Array,
   timeoutMs: number,
 ): Promise<Uint8Array> {
-  for (let attempt = 1; ; attempt++) {
+  let lastError: unknown = new Error("exchange never ran");
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const channel = instance.openChannel();
     const sender = createChannelSender(channel);
+    let delivered = false;
     try {
       await sender.sendAll(requestBytes);
-      const budget = attempt === 1 && timeoutMs > FIRST_ATTEMPT_GRACE_MS ? FIRST_ATTEMPT_GRACE_MS : timeoutMs;
-      return await sender.receiveAll(budget);
+      const out = await sender.receiveAll(timeoutMs, FIRST_CHUNK_BUDGET_MS);
+      delivered = true;
+      return out;
     } catch (error) {
-      if (attempt >= 2 || timeoutMs <= FIRST_ATTEMPT_GRACE_MS) throw error;
-      // fall through: retry once on a fresh channel
+      lastError = error;
+      console.warn(
+        "[data-plane] attempt", attempt + "/" + MAX_ATTEMPTS, "failed:",
+        error instanceof Error ? error.message : String(error),
+      );
     } finally {
-      sender.close();
+      // Closing a channel right after its transfer resets the SCTP stream and
+      // poisons later streams on the same association (see agent.go). Failed
+      // attempts must still close; successful channels are reclaimed when the
+      // peer connection goes away.
+      if (!delivered) sender.close();
     }
   }
+  throw lastError;
 }
 
 /** Convenience: build a data plane instance from a peer connection handle. */

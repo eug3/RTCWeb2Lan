@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -40,9 +41,17 @@ type Agent struct {
 }
 
 // New creates an agent. onCandidate is called for locally gathered candidates.
+//
+// When advertiseCIDR is set, host candidates outside it are not advertised:
+// pairs through a routable-but-asymmetric path can pass ICE checks yet never
+// carry SCTP data, which shows up as connections that open channels but never
+// deliver a response. Restricting advertisement pins peers onto the overlay
+// network. Server-reflexive and relay candidates are always advertised so
+// external browsers keep a path in.
 func New(
 	cfg webrtc.Configuration,
 	routes *RouteTable,
+	advertiseCIDR *net.IPNet,
 	onCandidate func(webrtc.ICECandidateInit),
 	logger *log.Logger,
 ) (*Agent, error) {
@@ -56,6 +65,13 @@ func New(
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
 			return
+		}
+		if advertiseCIDR != nil && c.Typ == webrtc.ICECandidateTypeHost {
+			ip := net.ParseIP(c.Address)
+			if ip == nil || !advertiseCIDR.Contains(ip) {
+				logger.Printf("skip host candidate %s (outside advertise CIDR)", c.Address)
+				return
+			}
 		}
 		if c.Typ == webrtc.ICECandidateTypeRelay {
 			a.mu.Lock()
@@ -135,8 +151,12 @@ func (a *Agent) Close() error { return a.pc.Close() }
 // serveChannel handles exactly one HTTP request/response over one DataChannel.
 func (a *Agent) serveChannel(dc *webrtc.DataChannel) {
 	reader, writer := io.Pipe()
+	// Do NOT close the DataChannel after responding: resetting an SCTP
+	// stream right after a large transfer wedges every stream opened later on
+	// the same association (verified: 2nd MB-sized transfer always died).
+	// Channels are reclaimed when the peer connection closes; the per-request
+	// leak is bounded by the page lifetime (SCTP allows 65535 streams).
 	defer func() {
-		_ = dc.Close()
 		_ = reader.Close()
 	}()
 
@@ -245,6 +265,12 @@ func (a *Agent) httpClient(target *Target) *http.Client {
 
 // writeResponse fragments the serialized response, then sends the empty
 // end-of-message marker.
+//
+// Sends are backpressured on the SCTP buffer amount: without a cap a burst of
+// multi-megabyte responses makes pion buffer unboundedly, and the association
+// degrades to a wedge after a couple of transfers.
+const maxSendBuffered = 1 * 1024 * 1024
+
 func writeResponse(dc *webrtc.DataChannel, resp *http.Response) error {
 	pr, pw := io.Pipe()
 
@@ -264,6 +290,10 @@ func writeResponse(dc *webrtc.DataChannel, resp *http.Response) error {
 	for {
 		n, err := pr.Read(buf)
 		if n > 0 {
+			// Let the SCTP layer drain before queueing the next chunk.
+			for dc.BufferedAmount() > maxSendBuffered {
+				time.Sleep(5 * time.Millisecond)
+			}
 			if e := dc.Send(buf[:n]); e != nil {
 				sendErr = e
 				_ = pr.Close()

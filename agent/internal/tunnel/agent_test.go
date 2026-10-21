@@ -53,7 +53,7 @@ func exchange(t *testing.T, routes *tunnel.RouteTable, request string) string {
 	<-gathered
 
 	logger := log.New(os.Stderr, "[agent-test] ", log.LstdFlags)
-	agent, err := tunnel.New(webrtc.Configuration{}, routes, func(webrtc.ICECandidateInit) {}, logger)
+	agent, err := tunnel.New(webrtc.Configuration{}, routes, nil, func(webrtc.ICECandidateInit) {}, logger)
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}

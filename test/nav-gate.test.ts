@@ -55,12 +55,17 @@ describe("decideNavigation", () => {
 });
 
 describe("injectHolderIntoHtml", () => {
-  it("inserts the iframe before </body>", () => {
+  it("inserts the SW guard and the iframe before </body>", () => {
     const html = "<html><body><h1>hi</h1></body></html>";
     const out = injectHolderIntoHtml(html, "/__lan/holder.html");
-    expect(out).toBe(
-      '<html><body><h1>hi</h1><iframe src="/__lan/holder.html" style="display:none;width:0;height:0;border:0" aria-hidden="true" tabindex="-1" title="web2lan-holder"></iframe></body></html>',
+    expect(out).toContain('var ours = "/__lan/sw.js"');
+    expect(out).toContain(
+      '<iframe src="/__lan/holder.html" style="display:none;width:0;height:0;border:0" aria-hidden="true" tabindex="-1" title="web2lan-holder"></iframe>',
     );
+    expect(out?.endsWith("</body></html>")).toBe(true);
+    // With a </head>, the guard sits before any body content the app runs.
+    const withHead = injectHolderIntoHtml('<html><head><title>t</title></head><body><h1>hi</h1></body></html>', "/__lan/holder.html");
+    expect(withHead!.indexOf("<script>")).toBeLessThan(withHead!.indexOf("<h1>"));
   });
 
   it("handles uppercase </BODY>", () => {

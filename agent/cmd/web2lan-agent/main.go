@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"net"
 	"errors"
 	"flag"
 	"fmt"
@@ -43,6 +44,7 @@ func main() {
 		turnUser   = flag.String("turn-user", "", "TURN username")
 		turnPass   = flag.String("turn-pass", "", "TURN credential")
 		insecure   = flag.Bool("insecure-upstream", false, "skip TLS verification against upstreams")
+		advCIDR    = flag.String("advertise-cidr", "", "only advertise host candidates inside this CIDR, e.g. 10.1.1.0/24 (srflx/relay always kept)")
 	)
 	flag.Parse()
 
@@ -72,11 +74,21 @@ func main() {
 	}
 	webrtcConfig := webrtc.Configuration{ICEServers: iceServers}
 
+	var advertiseNet *net.IPNet
+	if *advCIDR != "" {
+		_, n, err := net.ParseCIDR(*advCIDR)
+		if err != nil {
+			logger.Fatalf("invalid -advertise-cidr: %v", err)
+		}
+		advertiseNet = n
+		logger.Printf("advertising host candidates only inside %s", *advCIDR)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	for {
-		if err := run(ctx, logger, *signalURL, *room, *secret, routes, webrtcConfig); err != nil {
+		if err := run(ctx, logger, *signalURL, *room, *secret, routes, webrtcConfig, advertiseNet); err != nil {
 			if errors.Is(err, context.Canceled) {
 				return
 			}
@@ -118,6 +130,7 @@ func run(
 	signalURL, room, secret string,
 	routes *tunnel.RouteTable,
 	webrtcConfig webrtc.Configuration,
+	advertiseNet *net.IPNet,
 ) error {
 	client, err := signaling.Dial(ctx, signalURL, room, secret, logger)
 	if err != nil {
@@ -169,7 +182,7 @@ func run(
 				if agent != nil {
 					_ = agent.Close()
 				}
-				a, err := tunnel.New(webrtcConfig, routes, func(c webrtc.ICECandidateInit) {
+				a, err := tunnel.New(webrtcConfig, routes, advertiseNet, func(c webrtc.ICECandidateInit) {
 					out := protocol.New(protocol.TypeCandidate, m.Session)
 					out.Candidate = c.Candidate
 					if c.SDPMid != nil {

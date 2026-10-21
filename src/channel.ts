@@ -40,8 +40,13 @@ export function fragment(data: Uint8Array, mtu = MTU): ArrayBuffer[] {
 export interface ChannelSender {
   /** Send the whole payload (fragmented) then the empty end-of-message marker. */
   sendAll(data: Uint8Array): Promise<void>;
-  /** Read until the peer sends its empty marker; resolves with the joined bytes. */
-  receiveAll(timeoutMs?: number): Promise<Uint8Array>;
+  /**
+   * Read until the peer sends its empty marker; resolves with the joined bytes.
+   * `firstChunkMs` bounds how long the FIRST fragment may take: a wedged SCTP
+   * stream never delivers anything, so waiting the full timeout on it only
+   * burns the caller's budget — fail fast instead.
+   */
+  receiveAll(timeoutMs?: number, firstChunkMs?: number): Promise<Uint8Array>;
   close(): void;
 }
 
@@ -106,11 +111,25 @@ export function createChannelSender(dc: DataChannelLike, maxBuffered = 4 * 1024 
     wake();
   });
 
-  const waitOpen = (): Promise<void> => {
+  const waitOpen = (timeoutMs = 3_000): Promise<void> => {
     if (dc.readyState === "open") return Promise.resolve();
+    // A channel that never leaves "connecting" (DCEP ack lost on some pion /
+    // Chrome combinations) would hang sendAll forever and wedge the whole
+    // serial queue behind it — fail fast so the retry can open a fresh one.
     return new Promise<void>((resolve, reject) => {
-      dc.addEventListener("open", () => resolve());
-      dc.addEventListener("close", () => reject(new Error("data channel closed before open")));
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new ChannelTimeoutError("channel open", timeoutMs));
+      }, timeoutMs);
+      const onOpen = () => { cleanup(); resolve(); };
+      const onClose = () => { cleanup(); reject(new Error("data channel closed before open")); };
+      const cleanup = () => {
+        clearTimeout(timer);
+        dc.removeEventListener?.("open", onOpen);
+        dc.removeEventListener?.("close", onClose);
+      };
+      dc.addEventListener("open", onOpen);
+      dc.addEventListener("close", onClose);
     });
   };
 
@@ -128,11 +147,15 @@ export function createChannelSender(dc: DataChannelLike, maxBuffered = 4 * 1024 
       dc.send(new ArrayBuffer(0));
     },
 
-    async receiveAll(timeoutMs = 120_000): Promise<Uint8Array> {
-      const deadline = Date.now() + timeoutMs;
+    async receiveAll(timeoutMs = 120_000, firstChunkMs?: number): Promise<Uint8Array> {
+      const started = Date.now();
+      const deadline = started + timeoutMs;
       for (;;) {
         if (failed) throw failed;
         if (done) break;
+        if (firstChunkMs !== undefined && chunks.length === 0 && Date.now() - started > firstChunkMs) {
+          throw new ChannelTimeoutError("no first chunk within " + firstChunkMs + "ms", firstChunkMs);
+        }
         const remaining = deadline - Date.now();
         if (remaining <= 0) throw new ChannelTimeoutError("receive", timeoutMs);
         await new Promise<void>((resolve) => {

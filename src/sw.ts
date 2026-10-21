@@ -9,8 +9,7 @@
 
 import { resolveRoute, type RouteRule } from "./router.js";
 import { encodeRequest, parseResponse } from "./http1.js";
-import { withTimeout, type OverlayTransport } from "./transport.js";
-import { createMockTransport } from "./mock-transport.js";
+import { withTimeout } from "./transport.js";
 import { PortOverlayTransport } from "./port-transport.js";
 import {
   decideNavigation,
@@ -74,13 +73,7 @@ let endpoint: { signalUrl: string; room: string; stun: string } | null = null;
  */
 let overlayEnabled = false;
 
-let transport: OverlayTransport | null = null;
 let portTransport: PortOverlayTransport | null = null;
-
-function getTransport(): OverlayTransport {
-  transport ??= createMockTransport();
-  return transport;
-}
 
 function attachDataPlanePort(port: MessagePort): void {
   portTransport?.dispose();
@@ -91,7 +84,6 @@ function attachDataPlanePort(port: MessagePort): void {
     overlayEnabled = false;
     void notifyOverlayDown();
   };
-  transport = portTransport;
 }
 
 /**
@@ -105,7 +97,6 @@ function dropDeadTransport(): void {
   overlayEnabled = false;
   portTransport?.dispose();
   portTransport = null;
-  transport = null;
   void notifyOverlayDown();
 }
 
@@ -169,6 +160,12 @@ self.addEventListener("message", (event: ExtendableMessageEvent) => {
   }
 
   if (data?.type === "overlay:enable") {
+    // Never intercept without a live data plane: without this guard a stray
+    // enable (e.g. a holder racing a drop) silently serves mock responses.
+    if (!portTransport || !portTransport.isReady) {
+      event.source?.postMessage({ type: "overlay:enable-rejected", reason: "no data plane" });
+      return;
+    }
     overlayEnabled = true;
     event.source?.postMessage({ type: "overlay:enabled" });
     return;
@@ -178,7 +175,6 @@ self.addEventListener("message", (event: ExtendableMessageEvent) => {
     overlayEnabled = false;
     portTransport?.dispose();
     portTransport = null;
-    transport = null;
     event.source?.postMessage({ type: "overlay:disabled" });
     return;
   }
@@ -306,13 +302,32 @@ async function tunnel(
 
   let responseBytes: Uint8Array;
   try {
+    const t = portTransport;
+    if (!t) throw new Error("no data plane attached");
     responseBytes = await withTimeout(
-      getTransport().exchange(route.authority, wire),
+      t.exchange(route.authority, wire),
       config.exchangeTimeoutMs,
       "overlay exchange with " + route.authority,
     );
   } catch (error) {
     dropDeadTransport();
+    // GET/HEAD have no side effects, so serving them from the origin beats a
+    // 504 during the reconnect window. POSTs may already have been executed
+    // upstream (request delivered, reply lost) and are not replayed.
+    if (request.method === "GET" || request.method === "HEAD") {
+      try {
+        const origin = await fetch(request);
+        const headers = new Headers(origin.headers);
+        headers.set("x-w2l", "fallback");
+        return new Response(origin.body, {
+          status: origin.status,
+          statusText: origin.statusText,
+          headers,
+        });
+      } catch {
+        /* fall through to the error below */
+      }
+    }
     const message = error instanceof Error ? error.message : String(error);
     return textResponse(504, "overlay error: " + message);
   }
