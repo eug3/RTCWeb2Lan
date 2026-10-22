@@ -23,6 +23,8 @@ import {
   setOverlayEnabled,
 } from "./connect-flow.js";
 import { applySetCookies } from "./cookie-relay.js";
+import { loadAndApplyConfig } from "./config-loader.js";
+import { DEFAULT_SITE_CONFIG, DEFAULT_SIGNALING_PROFILE, type SignalingProfile, type SiteProfile } from "./config.js";
 import type { PeerConnectionHandle } from "./peer.js";
 
 const ASSET_BASE = (() => {
@@ -32,18 +34,23 @@ const ASSET_BASE = (() => {
 
 const SW_URL = import.meta.env.DEV ? "/src/sw.ts" : ASSET_BASE + "/sw.js";
 
-function defaultEndpoint(): { signalUrl: string; room: string; stun: string } {
+function defaultEndpoint(signaling: SignalingProfile): { signalUrl: string; room: string; stun: string } {
   const wsScheme = location.protocol === "https:" ? "wss:" : "ws:";
   const params = new URLSearchParams(location.search);
   return {
     signalUrl: params.get("signal") ?? wsScheme + "//" + location.host + ASSET_BASE + "/ws",
-    room: params.get("room") ?? "lan",
-    stun: params.get("stun") ?? "stun:stun.chat.bilibili.com:3478",
+    // Query string still wins (handy for one-off tests); otherwise use config.
+    room: params.get("room") ?? signaling.room,
+    stun: params.get("stun") ?? signaling.stun,
   };
 }
 
-const endpoint = defaultEndpoint();
+// Initialised from defaults; recomputed from config once it loads in main().
+let endpoint = defaultEndpoint(DEFAULT_SIGNALING_PROFILE);
 const log = (...args: unknown[]) => console.info("[holder]", ...args);
+
+/** Site behaviour (probe path etc.), populated from config at startup. */
+let siteProfile: SiteProfile = DEFAULT_SITE_CONFIG.site;
 
 let peer: PeerConnectionHandle | null = null;
 let connecting = false;
@@ -138,7 +145,7 @@ async function periodicHealthCheck(): Promise<void> {
   // Cheap liveness probe through the tunnel; a failing probe means the path
   // is broken even though the PC object still looks fine. Boot bursts queue
   // exchanges, so a single slow probe is noise — only two in a row count.
-  const ok = await probeTunnel("/api/projects", 15000);
+  const ok = await probeTunnel(siteProfile.probePath, 15000);
   if (ok) {
     healthFailures = 0;
     return;
@@ -160,6 +167,12 @@ async function main(): Promise<void> {
   await navigator.serviceWorker.register(SW_URL, { type: "module", scope: "/" }).catch(() => {});
   await ensureOurWorker(SW_URL);
   await rememberEndpoint(endpoint);
+
+  // Load deployment config and hand it to the SW before we start tunnelling.
+  // A failure here keeps the defaults (no intranet addresses, ask the agent).
+  const config = await loadAndApplyConfig(ASSET_BASE).catch(() => DEFAULT_SITE_CONFIG);
+  siteProfile = config.site;
+  endpoint = defaultEndpoint(config.signaling);
 
   navigator.serviceWorker.addEventListener("message", (event: MessageEvent) => {
     const d = event.data as { type?: string; cookies?: string[] };

@@ -9,6 +9,8 @@
  */
 
 import { connectFlow, ensureOurWorker, rememberEndpoint, type ConnectStage } from "./connect-flow.js";
+import { loadSiteConfig, pushConfigToServiceWorker } from "./config-loader.js";
+import { DEFAULT_SIGNALING_PROFILE, type SignalingProfile } from "./config.js";
 
 const ASSET_BASE = (() => {
   const path = window.location.pathname;
@@ -41,17 +43,19 @@ interface Endpoint {
   stun: string;
 }
 
-function readEndpoint(): Endpoint {
+function readEndpoint(signaling: SignalingProfile): Endpoint {
   const wsScheme = location.protocol === "https:" ? "wss:" : "ws:";
   const params = new URLSearchParams(location.search);
   return {
     signalUrl: params.get("signal") ?? wsScheme + "//" + location.host + ASSET_BASE + "/ws",
-    room: params.get("room") ?? "lan",
-    stun: params.get("stun") ?? "stun:stun.chat.bilibili.com:3478",
+    // Query string wins (one-off tests); otherwise config, then built-in.
+    room: params.get("room") ?? signaling.room,
+    stun: params.get("stun") ?? signaling.stun,
   };
 }
 
-const endpoint = readEndpoint();
+// Initialised from defaults; recomputed from config at the start of boot().
+let endpoint = readEndpoint(DEFAULT_SIGNALING_PROFILE);
 
 function setStage(text: string, cls: "" | "ok" | "bad" = ""): void {
   stageEl.textContent = text;
@@ -115,6 +119,12 @@ function finish(): void {
 }
 
 async function boot(): Promise<void> {
+  // Load deployment config (fetch only — do NOT push yet: the SW is not
+  // registered on a first visit, and push awaits navigator.serviceWorker.ready,
+  // which would deadlock before registration below).
+  const config = await loadSiteConfig(ASSET_BASE).catch(() => undefined);
+  if (config) endpoint = readEndpoint(config.signaling);
+
   el<HTMLAnchorElement>("diag-link").href =
     ASSET_BASE + "/?signal=" + encodeURIComponent(endpoint.signalUrl) + "&room=" + encodeURIComponent(endpoint.room);
 
@@ -158,6 +168,8 @@ async function boot(): Promise<void> {
   }
 
   await rememberEndpoint(endpoint);
+  // Now that the SW is active, hand it the config and start connecting.
+  if (config) await pushConfigToServiceWorker(config).catch(() => {});
   void run();
 }
 

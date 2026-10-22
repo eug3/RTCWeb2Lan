@@ -1,0 +1,29 @@
+{
+  "_doc": [
+    "Web2Lan overlay config. Edit this file and reload the page — no rebuild.",
+    "routes: map a public host (or path prefix) to an intranet target.",
+    "  kind='host'   -> whole host goes to one target",
+    "  kind='prefix' -> a path prefix on a host goes to one target",
+    "site.apiPrefixes  -> path prefixes the Service Worker tunnels (rest stays on nginx)",
+    "site.neverTunnel  -> paths that must always hit the origin (auth needing httpOnly cookies)",
+    "site.probePath    -> path used to verify the tunnel; any HTTP status counts as alive",
+    "signaling.room    -> signaling room to join",
+    "signaling.stun    -> comma-separated STUN URLs ('' disables STUN)"
+  ],
+  "routes": [
+    {
+      "kind": "host",
+      "host": "sense.jshuaxin.net",
+      "target": { "ipv4": "10.1.1.230", "port": 9011 }
+    }
+  ],
+  "site": {
+    "apiPrefixes": ["/api/"],
+    "neverTunnel": ["/api/auth/session"],
+    "probePath": "/health"
+  },
+  "signaling": {
+    "room": "lan",
+    "stun": "stun:stun.chat.bilibili.com:3478"
+  }
+}

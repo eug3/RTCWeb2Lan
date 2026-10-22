@@ -7,7 +7,14 @@
  * back into a Response. Everything else falls through untouched.
  */
 
-import { resolveRoute, type RouteRule } from "./router.js";
+import { resolveRoute } from "./router.js";
+import {
+  DEFAULT_SITE_CONFIG,
+  mergeSiteConfig,
+  normalizeSiteConfig,
+  type RouteRule,
+  type SiteConfig,
+} from "./config.js";
 import { encodeRequest, parseResponse } from "./http1.js";
 import { withTimeout } from "./transport.js";
 import { PortOverlayTransport } from "./port-transport.js";
@@ -35,30 +42,22 @@ function pageUrl(name: string): URL {
 const CONNECT_URL = pageUrl("connect.html");
 const HOLDER_URL = pageUrl("holder.html");
 
-export interface OverlayConfig {
-  rules: RouteRule[];
+/**
+ * Runtime configuration. Rules and site behaviour come from config.ts; this
+ * object also carries the exchange timeout, which is operational rather than
+ * site-specific.
+ *
+ * The defaults contain no intranet addresses: a deployment either ships a
+ * config.json (loadSiteConfig, wired by the page) or posts overlay:configure.
+ */
+export interface OverlayConfig extends SiteConfig {
   exchangeTimeoutMs?: number;
-  /** Path prefixes to tunnel. Defaults to ["/api/"]. */
-  apiPrefixes?: string[];
 }
-
-// In prefix mode the agent resolves the real intranet target from its own route
-// table (routes.yaml), so the browser only needs to say WHICH public host it is
-// standing in for. The authority here is a logical key, not an IP to dial.
-const DEFAULT_RULES: RouteRule[] = [
-  { kind: "host", host: "sense.jshuaxin.net", target: { ipv4: "10.1.1.230", port: 9011 } },
-  // publicHost tells the agent which site this stands for; it resolves the
-  // intranet address itself from routes.yaml.
-  { kind: "prefix", host: "127.0.0.1", prefix: "/tunnel/sense", target: { ipv4: "10.1.1.230", port: 9011 }, publicHost: "sense.jshuaxin.net" },
-  { kind: "prefix", host: "localhost", prefix: "/tunnel/sense", target: { ipv4: "10.1.1.230", port: 9011 }, publicHost: "sense.jshuaxin.net" },
-  { kind: "prefix", host: "127.0.0.1", prefix: "/tunnel/154", target: { ipv4: "10.1.1.154", port: 80 } },
-  { kind: "prefix", host: "localhost", prefix: "/tunnel/154", target: { ipv4: "10.1.1.154", port: 80 } },
-];
 
 // Generous because it also covers the data plane's serial exchange queue during
 // SPA boot bursts; true port death is detected faster by PortOverlayTransport's
 // own internal timeout.
-let config: OverlayConfig = { rules: DEFAULT_RULES, exchangeTimeoutMs: 45_000 };
+let config: OverlayConfig = { ...DEFAULT_SITE_CONFIG, exchangeTimeoutMs: 45_000 };
 
 /** Last signaling endpoint a page used, so injected holders reconnect the same way. */
 let endpoint: { signalUrl: string; room: string; stun: string } | null = null;
@@ -138,6 +137,7 @@ self.addEventListener("message", (event: ExtendableMessageEvent) => {
     | {
         type?: string;
         config?: Partial<OverlayConfig>;
+        json?: unknown;
         signalUrl?: string;
         room?: string;
         stun?: string;
@@ -145,11 +145,23 @@ self.addEventListener("message", (event: ExtendableMessageEvent) => {
     | undefined;
 
   if (data?.type === "overlay:configure" && data.config) {
-    config = { ...config, ...data.config };
-    if (Array.isArray(data.config.apiPrefixes) && data.config.apiPrefixes.length > 0) {
-      apiPrefixes = data.config.apiPrefixes;
-    }
-    event.source?.postMessage({ type: "overlay:configured", rules: config.rules });
+    const { exchangeTimeoutMs, ...siteOverride } = data.config;
+    const merged: OverlayConfig = {
+      ...mergeSiteConfig(config, siteOverride),
+      exchangeTimeoutMs: exchangeTimeoutMs ?? config.exchangeTimeoutMs,
+    };
+    config = merged;
+    event.source?.postMessage({ type: "overlay:configured", config });
+    return;
+  }
+
+  if (data?.type === "overlay:config-json" && data.json !== undefined) {
+    // A deployment can hand the SW a whole config document directly (the page
+    // fetched config.json and forwarded it). Validate/normalise it here too.
+    const normalized = normalizeSiteConfig(data.json);
+    const mergedJson: OverlayConfig = { ...normalized, exchangeTimeoutMs: config.exchangeTimeoutMs };
+    config = mergedJson;
+    event.source?.postMessage({ type: "overlay:configured", config });
     return;
   }
 
@@ -204,22 +216,17 @@ self.addEventListener("message", (event: ExtendableMessageEvent) => {
 /**
  * Which requests are tunnelled.
  *
- * Only API calls go over the overlay; static assets stay on nginx, which is
- * both faster (cached, CDN-able) and avoids the "<base href> rewrites the asset
- * path" problem entirely. Override with the `apiPrefixes` config field.
+ * Only the configured API prefixes go over the overlay; static assets stay on
+ * nginx, which is both faster (cached, CDN-able) and avoids the "<base href>
+ * rewrites the asset path" problem entirely.
+ *
+ * `neverTunnel` always wins: those paths must consult the origin (auth endpoints
+ * that answer 200-instead-of-401, or that need the browser's httpOnly cookie,
+ * which the SW cannot read off a Request).
  */
-let apiPrefixes: string[] = ["/api/"];
-
-/**
- * Paths that must always consult the origin. The auth-state endpoint reports
- * login via a 200 body instead of 401, so it cannot self-heal through the
- * 401 fallback — and the tunnel cannot carry the browser's httpOnly session
- * cookie. Asking the origin lets the browser answer with its own cookie.
- */
-const NEVER_TUNNEL = ["/api/auth/session"];
-
 function shouldTunnel(pathname: string): boolean {
-  if (NEVER_TUNNEL.some((p) => pathname === p || pathname.startsWith(p + "/"))) return false;
+  const { neverTunnel, apiPrefixes } = config.site;
+  if (neverTunnel.some((p) => pathname === p || pathname.startsWith(p + "/"))) return false;
   return apiPrefixes.some((p) => pathname.startsWith(p));
 }
 
@@ -253,7 +260,8 @@ self.addEventListener("fetch", (event: FetchEvent) => {
   if (!overlayEnabled) return;
   if (!shouldTunnel(url.pathname)) return;
 
-  const route = resolveRoute(url.hostname, url.pathname, url.search, config.rules);
+  const overlayRoutes: RouteRule[] = config.routes;
+  const route = resolveRoute(url.hostname, url.pathname, url.search, overlayRoutes);
   if (route === null) return;
   event.respondWith(tunnel(event.request, route));
 });

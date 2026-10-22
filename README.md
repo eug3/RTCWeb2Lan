@@ -49,6 +49,31 @@ ssh beijihu@10.1.1.229 'cd ~/web2lan && mv web2lan-agent.new web2lan-agent && ch
 - Agent 日志(229 `~/web2lan/agent.log`)能看到 `GET/POST … -> http://10.1.1.230:9011` 即隧道转发生效。
 - 状态行:`P2P 直连`(local=host/srflx)优于 `经 TURN 中转`;打洞失败自动 `回落反代`。
 
+## 配置(解耦:改配置不改代码)
+
+前端**不再写死任何内网地址或站点路径**。所有站点相关信息集中在 `public/config.json`(⚠️ 不要把密钥之类放这里;它随静态资源公开),**发布到 `dist/config.json`,改完刷新页面即生效,无需重新构建**。
+
+```jsonc
+{
+  "routes": [
+    { "kind": "host", "host": "sense.jshuaxin.net",
+      "target": { "ipv4": "10.1.1.230", "port": 9011 } }
+  ],
+  "site": {
+    "apiPrefixes": ["/api/"],              // 走隧道的路径前缀;其余静态资源留在 nginx
+    "neverTunnel": ["/api/auth/session"],  // 永远走源站(需要浏览器 httpOnly cookie 的接口)
+    "probePath": "/health"                 // 建链后验证隧道的探针;任意 HTTP 状态即视为通
+  },
+  "signaling": { "room": "lan", "stun": "stun:stun.chat.bilibili.com:3478" }
+}
+```
+
+- **routes**:公网 Host/前缀 → 内网目标。`kind="host"` 整站路由,`kind="prefix"` 路径前缀路由。
+- **site/***:站点行为。`probePath` 默认 `/`,建议改成轻量健康接口(别用慢的业务接口,否则健康隧道会被误判为死)。
+- **signaling**:信令房间与 STUN(`stun: ""` 关闭 STUN,仅主机候选,适合纯内网)。
+- 加载顺序:①`?config=<urlencoded JSON>` 查询参数(临时测试)> ②`config.json` > ③ 内置默认(不含内网地址)。
+- 代码位置:`src/config.ts`(契约/默认值/校验)、`src/config-loader.ts`(加载并推给 SW)、`src/sw.ts`(按 config 决定拦哪些路径、路由到哪)。
+
 ## 本地开发
 
 ```bash

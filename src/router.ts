@@ -14,16 +14,20 @@
  *                    portal.example.com /grafana/* -> 10.1.1.90:3000
  *
  * Anything unmatched falls through to the real network untouched.
+ *
+ * Types and target parsing live in config.ts (the single configuration
+ * contract); this module only resolves a request against a rule set.
  */
 
-export interface OverlayTarget {
-  ipv4: string;
-  port: number;
-}
+import { targetToAuthority, type OverlayTarget, type RouteRule } from "./config.js";
 
-export type RouteRule =
-  | { kind: "host"; host: string; target: OverlayTarget }
-  | { kind: "prefix"; host: string; prefix: string; target: OverlayTarget; publicHost?: string };
+export type { OverlayTarget, RouteRule } from "./config.js";
+export {
+  isValidIPv4,
+  parseAuthority,
+  parseTarget,
+  targetToAuthority,
+} from "./config.js";
 
 export interface ResolvedRoute {
   target: OverlayTarget;
@@ -39,40 +43,6 @@ export interface ResolvedRoute {
   /** Path + query sent upstream — normally identical to the incoming one. */
   upstreamPath: string;
   authority: string;
-}
-
-const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
-
-export function isValidIPv4(value: string): boolean {
-  const m = IPV4_RE.exec(value);
-  if (!m) return false;
-  for (let i = 1; i <= 4; i++) {
-    const part = m[i]!;
-    if (part.length > 1 && part.startsWith("0")) return false;
-    if (Number(part) > 255) return false;
-  }
-  return true;
-}
-
-export function parseTarget(ipv4: string, port: number): OverlayTarget {
-  if (!isValidIPv4(ipv4)) throw new Error(`invalid IPv4: ${JSON.stringify(ipv4)}`);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`invalid port: ${JSON.stringify(port)}`);
-  }
-  return { ipv4, port };
-}
-
-/** "10.1.1.230:9011" shorthand for config convenience. */
-export function parseAuthority(authority: string, defaultPort = 80): OverlayTarget {
-  const colon = authority.lastIndexOf(":");
-  const ipv4 = colon === -1 ? authority : authority.slice(0, colon);
-  const portText = colon === -1 ? "" : authority.slice(colon + 1);
-  const port = portText === "" ? defaultPort : Number(portText);
-  return parseTarget(ipv4, port);
-}
-
-export function targetToAuthority(t: OverlayTarget): string {
-  return `${t.ipv4}:${t.port}`;
 }
 
 /**

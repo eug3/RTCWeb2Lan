@@ -158,7 +158,7 @@ export async function ensureOurWorker(
  * Must carry its own timeout: a connected-but-dead peer (wedged agent) never
  * answers, and without a deadline the whole connect flow would hang forever.
  */
-export async function probeTunnel(path = "/api/projects", timeoutMs = 8000): Promise<boolean> {
+export async function probeTunnel(path = "/", timeoutMs = 8000): Promise<boolean> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {

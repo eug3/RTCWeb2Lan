@@ -9,6 +9,8 @@
 
 import { attachDataPlane, instanceFromPeer } from "./data-plane.js";
 import { connectAsInitiator, type PeerConnectionHandle, type SignalChannel } from "./peer.js";
+import { loadAndApplyConfig } from "./config-loader.js";
+import { DEFAULT_SITE_CONFIG, DEFAULT_SIGNALING_PROFILE, type SignalingProfile, type SiteProfile } from "./config.js";
 import type { SignalMessage } from "./signaling.js";
 
 /**
@@ -50,10 +52,11 @@ function setStatus(node: HTMLElement, text: string, cls: "ok" | "bad" | "idle") 
 const P2P_PROBE_TIMEOUT_MS = 15000;
 
 /**
- * Path used to verify the tunnel. It must be an intranet path the agent can
- * route; a 404 from the intranet still proves the tunnel round-tripped.
+ * Path used to verify the tunnel, from the site config (default "/"). Any HTTP
+ * status proves the tunnel round-tripped; see probeTunnel.
  */
-const PROBE_PATH = "/tunnel/sense/health";
+let siteProfile: SiteProfile = DEFAULT_SITE_CONFIG.site;
+let signalingProfile: SignalingProfile = DEFAULT_SIGNALING_PROFILE;
 
 const dataPath = el<HTMLSpanElement>("data-path");
 const warnProbe = el<HTMLDivElement>("warn");
@@ -139,7 +142,7 @@ async function setOverlayEnabled(enabled: boolean): Promise<void> {
 /** True when a request actually came back through the overlay. */
 async function probeOverlay(): Promise<boolean> {
   try {
-    const res = await fetch(PROBE_PATH, { cache: "no-store", redirect: "manual" });
+    const res = await fetch(siteProfile.probePath, { cache: "no-store", redirect: "manual" });
     // Any HTTP answer proves the tunnel works; the agent decides the status.
     return res.status > 0;
   } catch {
@@ -287,7 +290,7 @@ async function boot() {
   // build works without hard-coded localhost values.
   const wsScheme = location.protocol === "https:" ? "wss:" : "ws:";
   const defaultSignal = wsScheme + "//" + location.host + ASSET_BASE + "/ws";
-  const defaultStun = "stun:stun.chat.bilibili.com:3478";
+  const defaultStun = signalingProfile.stun;
 
   el<HTMLInputElement>("in-signal").value = defaultSignal;
   el<HTMLInputElement>("in-stun").value = defaultStun;
@@ -322,6 +325,17 @@ async function boot() {
     }
     return;
   }
+
+  // Load deployment config and hand it to the SW before any tunnelling. A
+  // failure keeps defaults (no intranet addresses; the agent resolves routes).
+  const loadedConfig = await loadAndApplyConfig(ASSET_BASE).catch(() => DEFAULT_SITE_CONFIG);
+  siteProfile = loadedConfig.site;
+  signalingProfile = loadedConfig.signaling;
+  // Reflect config-driven signaling defaults into the form (query params already applied above win only if the user typed them; keep their value).
+  const stunInput = el<HTMLInputElement>("in-stun");
+  if (!params.get("stun")) stunInput.value = signalingProfile.stun;
+  const roomInput = el<HTMLInputElement>("in-room");
+  if (!params.get("room") && roomInput) roomInput.value = signalingProfile.room;
 
   // Auto-connect when the URL carries signaling parameters.
   //
