@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Serve intranet apps to a browser through the EasyTier WASM overlay, via Service Worker fetch interception.",
+  "description": "Access intranet web apps from any browser with an unchanged URL: Service Worker interception over a peer-to-peer WebRTC DataChannel, no intranet app changes.",
   "scripts": {
     "dev": "vite --port 5273 --host 127.0.0.1",
     "dev:stack": "bash scripts/dev-stack.sh",
