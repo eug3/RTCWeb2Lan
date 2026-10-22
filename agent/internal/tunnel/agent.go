@@ -91,7 +91,17 @@ func New(
 			_ = dc.Close()
 			return
 		}
-		go a.serveChannel(dc)
+		// Register the message handler SYNCHRONOUSLY, before returning to pion.
+		// pion starts the channel's SCTP read loop from inside its own
+		// OnDataChannel dispatch (handleOpen -> go readLoop) right after this
+		// callback returns. If we deferred OnMessage registration to a
+		// goroutine, the first request fragment could reach the read loop
+		// before the handler was set, and pion silently drops messages when
+		// the handler is nil (datachannel.onMessage: "if handler == nil { return }").
+		// That is the field "channel opens but the request never arrives" wedge.
+		// The buffered pipe below absorbs anything that arrives while the
+		// request goroutine is still starting up.
+		a.serveChannel(dc)
 	})
 
 	return a, nil
@@ -149,6 +159,12 @@ func (a *Agent) IsRelayed() bool {
 func (a *Agent) Close() error { return a.pc.Close() }
 
 // serveChannel handles exactly one HTTP request/response over one DataChannel.
+//
+// The OnMessage handler is registered here, synchronously, the moment pion
+// hands us the channel. The blocking request/response work is then run in a
+// goroutine so pion's accept loop is not held up. Registering before the
+// read loop starts is what prevents the first-fragment drop that produced the
+// "channel opens but no request arrives" wedge.
 func (a *Agent) serveChannel(dc *webrtc.DataChannel) {
 	reader, writer := io.Pipe()
 	// Do NOT close the DataChannel after responding: resetting an SCTP
@@ -157,7 +173,8 @@ func (a *Agent) serveChannel(dc *webrtc.DataChannel) {
 	// Channels are reclaimed when the peer connection closes; the per-request
 	// leak is bounded by the page lifetime (SCTP allows 65535 streams).
 	defer func() {
-		_ = reader.Close()
+		// reader is closed by the goroutine's defer below once it is done; this
+		// outer defer only guards against a handler that never runs.
 	}()
 
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
@@ -170,6 +187,14 @@ func (a *Agent) serveChannel(dc *webrtc.DataChannel) {
 			_ = dc.Close()
 		}
 	})
+
+	go a.handleRequest(dc, reader, writer)
+}
+
+// handleRequest reads one HTTP request off the channel's request stream,
+// proxies it, and writes the response back. It runs off pion's accept path.
+func (a *Agent) handleRequest(dc *webrtc.DataChannel, reader *io.PipeReader, writer *io.PipeWriter) {
+	defer func() { _ = reader.Close() }()
 
 	// A wedged SCTP stream opens the channel but never delivers the request
 	// bytes; without a deadline the browser-side retry (fresh channel) could
