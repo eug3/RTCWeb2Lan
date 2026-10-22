@@ -164,7 +164,11 @@ export async function probeTunnel(path = "/api/projects", timeoutMs = 8000): Pro
   try {
     const res = await fetch(path, { cache: "no-store", redirect: "manual", signal: controller.signal });
     if (res.status <= 0) return false;
-    return res.headers.get("server") === null;
+    // Evidence that the SW intercepted: either a tunnel reply (no `server`
+    // header) or one of our fallback markers — the 401 fallback replays via
+    // nginx (which stamps `server`), so the marker alone also proves the
+    // overlay path executed.
+    return res.headers.get("x-w2l") !== null || res.headers.get("server") === null;
   } catch {
     return false;
   } finally {

@@ -210,7 +210,16 @@ self.addEventListener("message", (event: ExtendableMessageEvent) => {
  */
 let apiPrefixes: string[] = ["/api/"];
 
+/**
+ * Paths that must always consult the origin. The auth-state endpoint reports
+ * login via a 200 body instead of 401, so it cannot self-heal through the
+ * 401 fallback — and the tunnel cannot carry the browser's httpOnly session
+ * cookie. Asking the origin lets the browser answer with its own cookie.
+ */
+const NEVER_TUNNEL = ["/api/auth/session"];
+
 function shouldTunnel(pathname: string): boolean {
+  if (NEVER_TUNNEL.some((p) => pathname === p || pathname.startsWith(p + "/"))) return false;
   return apiPrefixes.some((p) => pathname.startsWith(p));
 }
 
@@ -315,18 +324,8 @@ async function tunnel(
     // 504 during the reconnect window. POSTs may already have been executed
     // upstream (request delivered, reply lost) and are not replayed.
     if (request.method === "GET" || request.method === "HEAD") {
-      try {
-        const origin = await fetch(request);
-        const headers = new Headers(origin.headers);
-        headers.set("x-w2l", "fallback");
-        return new Response(origin.body, {
-          status: origin.status,
-          statusText: origin.statusText,
-          headers,
-        });
-      } catch {
-        /* fall through to the error below */
-      }
+      const viaOrigin = await replayViaOrigin(request, "fallback");
+      if (viaOrigin) return viaOrigin;
     }
     const message = error instanceof Error ? error.message : String(error);
     return textResponse(504, "overlay error: " + message);
@@ -340,7 +339,38 @@ async function tunnel(
     return textResponse(502, "bad overlay response: " + message);
   }
 
+  // A tunnelled request cannot carry the browser's httpOnly session cookie
+  // (the SW cannot read it off the Request), so a session the browser holds
+  // looks logged-out on the agent path. A 401 means the server rejected the
+  // request without side effects, so replaying via the origin — where the
+  // browser attaches its cookie natively — is safe for every method and
+  // keeps both paths in sync.
+  if (parsed.status === 401) {
+    const viaOrigin = await replayViaOrigin(request, "401-fallback");
+    if (viaOrigin) return viaOrigin;
+  }
+
   return toResponse(request, parsed);
+}
+
+/**
+ * Re-fetch an intercepted request straight from the origin (the browser
+ * attaches cookies natively) and tag the reply so tooling can tell the
+ * paths apart. Returns null when the origin attempt itself fails.
+ */
+async function replayViaOrigin(request: Request, marker: string): Promise<Response | null> {
+  try {
+    const origin = await fetch(request);
+    const headers = new Headers(origin.headers);
+    headers.set("x-w2l", marker);
+    return new Response(origin.body, {
+      status: origin.status,
+      statusText: origin.statusText,
+      headers,
+    });
+  } catch {
+    return null;
+  }
 }
 
 function textResponse(status: number, body: string): Response {
