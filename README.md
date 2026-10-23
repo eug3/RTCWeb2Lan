@@ -46,7 +46,7 @@ RTCWeb2Lan 用另一条路：
 
 1. **首次访问** `/__lan/connect.html`：注册 Service Worker（scope `/`）→ 连接信令房间 → WebRTC offer/answer → ICE 打洞 → 把页面侧数据面（MessagePort）交给 SW → 探测验证 → 跳转 `/`。
 2. **之后** 访问 `/`：SW 在返回的 HTML 里注入一个隐藏的 `holder.html` iframe，常驻持有 P2P 连接；页面之间跳转不断链，断线自动重连。
-3. **运行时**：SW 拦到命中配置的请求，序列化成 HTTP/1.1，经 DataChannel 送到内网 Agent；Agent 按路由表转发到真实服务，响应原路回灌。
+3. **运行时**：SW 拦到命中配置的请求，序列化成 HTTP/1.1，按帧协议（stream id）写进**同一条** DataChannel；Agent 按 stream 拆出请求、按路由表转发到真实服务，响应按同一 stream 回灌。
 4. **优雅降级**：P2P 不可用或连续交换失败时，SW 停止拦截，请求回落 fdn 内置的反向代理；holder 持续重连，恢复后自动切回 P2P。
 
 ### 设计要点
@@ -54,10 +54,11 @@ RTCWeb2Lan 用另一条路：
 | 要点 | 说明 |
 | --- | --- |
 | **URL 不变** | 目标地址只存在于路由表里，绝不进入地址栏或页面可见 URL。 |
-| **一请求一通道** | 每条 HTTP 请求开一条独立 DataChannel，天然隔离，无需自己实现流 ID 与重组。 |
-| **空消息作 EOF** | DataChannel 有序可靠，用空消息标记消息结束，不必加长度前缀。 |
-| **Cookie 双轨** | 隧道侧由 Agent 的 cookie jar 维持会话；回落侧由浏览器原生携带。需浏览器 cookie 的认证接口应配置为走源站（见下）。 |
-| **失败即降级** | 任何一环出问题都退回普通反向代理，宁可慢也不中断。 |
+| **单通道多路复用** | 所有交换共用一条 DataChannel，用帧头（kind + stream id）区分。每请求开新通道看似更简单，但每个请求都要一次 DCEP 握手，Chrome 与 pion 经常完不成，实测几乎全失败。 |
+| **帧标记 EOF** | DataChannel 有序可靠，用 END 帧标记消息结束，不必加长度前缀。 |
+| **Cookie 双轨** | 隧道侧由 Agent 的 cookie jar 维持会话（Agent 自己登录）；回落侧由浏览器原生携带 HttpOnly cookie。两套互不干扰。 |
+| **会话不可见** | Service Worker 读不到浏览器的任何 cookie（Chromium 设计，与 HttpOnly 无关）。所以隧道侧的会话只能由 Agent 自己持有，不能指望从浏览器借。 |
+| **失败即降级** | 任何一环出问题都退回普通反向代理，宁可慢也不中断。连续三次交换失败才判定数据面已死，单次抖动不会拆掉健康的连接。 |
 
 > 为什么不用现成的 overlay 方案？浏览器内的 WASM overlay 实现通常禁用 P2P（只能经 WebSocket 中继），无法满足「稳态流量不过公网」，因此本项目自建 WebRTC 数据面。
 
@@ -106,7 +107,7 @@ RTCWeb2Lan 用另一条路：
 | --- | --- |
 | `routes[]` | 公网 Host / 路径前缀 → 内网目标。`kind="host"` 整站路由；`kind="prefix"` 路径前缀路由（前缀是浏览器侧寻址糖，转发时剥掉）。 |
 | `site.apiPrefixes` | 走隧道的路径，默认 `["/api/"]`。其余静态资源留给兜底（更快、可缓存）。 |
-| `site.neverTunnel` | 永远走源站的路径前缀。按**路径段边界**匹配：`"/api/auth"` 覆盖 `/api/auth/login`，但不会误伤 `/api/authenticate`。 |
+| `site.neverTunnel` | 永远走源站的路径前缀。按**路径段边界**匹配：`"/api/auth"` 覆盖 `/api/auth/login`，但不会误伤 `/api/authenticate`。默认留空——把认证也交给隧道，Agent 自己持有会话（见「认证与会话」）。 |
 | `site.probePath` | 建链后的隧道探针，**任意 HTTP 状态都算通**。必须落在 `apiPrefixes` 之内，否则 Service Worker 不会拦截，探针会误判隧道已死。 |
 | `signaling.room` | 信令房间号，浏览器与 `tunnelagent` **必须一致**。 |
 | `signaling.stun` | STUN 服务器（逗号分隔）。设为 `""` 只用主机候选，适合纯内网。 |
@@ -139,13 +140,46 @@ routes:
 
 ### 认证与会话
 
-会话 cookie 通常带 `HttpOnly`，浏览器不允许任何 JS（**包括 Service Worker**）读取它。因此走隧道的认证请求会被目标服务视为未登录。
+这是本项目最容易踩错的地方，先讲清一条硬限制：
 
-推荐做法：**把认证接口配置到 `neverTunnel`**，让它走源站——浏览器会原生携带 cookie，同时避免「隧道侧 cookie jar」与「浏览器 cookie」两套会话状态互相打架。
+> **Service Worker 读不到浏览器的任何 cookie。**
+> 不是「读不到 HttpOnly」——是所有 cookie 都读不到。Chromium 在 SW 的 `fetch` 事件里根本不提供 `Cookie` 头，凭据由网络栈在 SW 之后附加。
+
+所以隧道里的请求**永远不可能带上浏览器的会话**。想让业务接口走 P2P，会话只能来自内网侧。
+
+#### 推荐做法：让 Agent 自己登录
+
+把认证接口**留在隧道内**（`neverTunnel` 为空），登录请求经隧道到达 Agent：
+
+```
+用户登录 → 隧道 → Agent → 目标服务返回 Set-Cookie
+                          ├→ Agent 的 cookie jar 保存 ✓
+                          └→ SW 转成 document.cookie 交给浏览器 ✓
+```
+
+两边各自持有会话，后续业务请求就能直接走隧道：
 
 ```jsonc
-"neverTunnel": ["/api/auth"]   // login / logout / session 一并覆盖
+"neverTunnel": []   // 认证也走隧道
 ```
+
+**代价**：浏览器侧那份 cookie 会失去 `HttpOnly`（`document.cookie` 无法创建 HttpOnly cookie，SW 转发时只能剥掉该属性）。若站点存在 XSS 风险且无法接受，改用下面的方案。
+
+#### 备选：认证走源站
+
+把认证接口排除在隧道外，浏览器原生携带 HttpOnly cookie：
+
+```jsonc
+"neverTunnel": ["/api/auth"]
+```
+
+这样最安全，但**所有业务接口都会先经隧道拿到 401，再由 SW 重放到源站**——功能正常，代价是每个请求走两次，P2P 实际上没有收益。除非你有额外手段让 Agent 持有会话（例如单独给它一份凭据），否则不建议。
+
+| 方案 | P2P 收益 | 浏览器 cookie | 需要给 Agent 凭据 |
+| --- | --- | --- | --- |
+| Agent 自登录（推荐） | **完整** | 失去 HttpOnly | 否 |
+| 认证走源站 | 无（每请求双跑） | 保留 HttpOnly | 否 |
+| 认证走源站 + Agent 自持凭据 | 完整 | 保留 HttpOnly | **是** |
 
 ---
 
@@ -289,7 +323,17 @@ curl -o /dev/null -w '%{http_code} -> %{redirect_url}\n' \
   -H 'Accept: text/html' -H 'Sec-Fetch-Mode: navigate' https://edge.example.com/     # 302
 ```
 
-浏览器打开 `https://edge.example.com/`，应看到连接页 → 自动进入站点。之后在 DevTools 里看 `/api/*` 响应头：**没有 `server` 头 = 走了隧道**。
+浏览器打开 `https://edge.example.com/`，应看到连接页 → 自动进入站点。之后在 DevTools 里看 `/api/*` 的响应头 `x-w2l`：
+
+| `x-w2l` | 含义 |
+| --- | --- |
+| `tunnel` | 完整走了隧道（P2P 直连） |
+| `401-fallback` | 隧道送到了，但上游要求登录，SW 重放走源站 |
+| `fallback` | 交换失败，直接走源站 |
+
+只有 `tunnel` 才算真正 P2P。若绝大多数是后两者，按「认证与会话」调整 `neverTunnel`。
+
+> 不要用「有没有 `server` 头」判断——上游可能自己发 `server`，源站也会盖一个，这个信号两个方向都不可靠。
 
 ### 首次访问的行为
 
@@ -320,11 +364,29 @@ docker rm -f fdn && docker run -d ... rtcweb2lan/fdn   # 用新镜像重跑
 | 连接页一直转，不进入 | `docker logs tunnelagent` 有无 `joined room`；信令 nginx 是否透传 `Upgrade` 头 |
 | 站点能开但全部走兜底 | 浏览器 `config.json` 是否加载成功；`probePath` 是否落在 `apiPrefixes` 内 |
 | `/__lan/ws` 返回 404 | `-prefix` 与实际路径不符 |
-| 登录后立刻掉登录态 | 认证接口没进 `neverTunnel`（见「认证与会话」） |
+| 登录后立刻掉登录态 | 认证接口没走隧道（`neverTunnel` 应为空，见「认证与会话」）；或 Agent 重启导致其 jar 丢失，重新登录一次 |
+| 所有请求都是 `401-fallback` | 同上；也可先看 `docker logs tunnelagent` 有无 `POST /api/auth/login` |
 | 兜底 502 | `routes.yaml` 里没有匹配该 Host 的条目；看 `docker logs fdn` 的 `no route:` |
 
 ---
 
+## 性能
+
+一组内网服务在千兆内网、浏览器经公网 TLS 边缘接入的实测（30 次 API 调用）：
+
+| 指标 | 数值 |
+| --- | --- |
+| P2P 命中率 | **30/30** |
+| p50 | **31ms** |
+| p95 | 42ms |
+| 最大 | 58ms |
+| 126 KB 响应 | 经隧道完整返回 |
+
+对比「每请求开一条 DataChannel」的旧实现：命中率 0/25，p50 78ms，最大 3080ms——几乎全部静默回落兜底。
+
+延迟大头在建链（约 2 秒，每个标签页一次），之后每个请求就是内网往返加隧道编解码开销。
+
+---
 
 ## 本地开发
 
@@ -359,7 +421,9 @@ pnpm --dir fdn/web dev   # 打开 /?signal=...&room=demo
 | `fdn/web/src/nav-gate.ts` | `/` 的导航决策（连接页 / 注入 holder / 直通）与 holder 注入 |
 | `fdn/web/src/connect.*` / `holder.*` | 连接页（建链重试、跳转）/ 常驻 iframe（持有数据面、健康检查、落 Cookie） |
 | `fdn/web/src/connect-flow.ts` | 建链流程（信令 → ICE → 接入 → 验证）与 SW 控制消息 |
-| `fdn/web/src/peer.ts` / `channel.ts` | RTCPeerConnection 封装 / 单通道收发约定（分片、空消息 EOF、背压） |
+| `fdn/web/src/peer.ts` | RTCPeerConnection 封装（发起/应答、通道工厂） |
+| `fdn/web/src/mux.ts` / `mux-client.ts` | 多路复用帧协议（kind + stream id）/ 客户端实现（单通道承载多请求） |
+| `fdn/web/src/channel.ts` | 分片、EOF 与背压的底层约定 |
 | `fdn/web/src/data-plane.ts` / `port-transport.ts` | 页面侧数据面 / SW ↔ 页面 MessagePort 传输 |
 | `fdn/web/src/http1.ts` / `router.ts` | HTTP/1.1 增量编解码 / Host + 前缀路由 |
 | `fdn/web/src/cookie-relay.ts` | Set-Cookie → `document.cookie` 转换（剥 HttpOnly） |
@@ -367,6 +431,7 @@ pnpm --dir fdn/web dev   # 打开 /?signal=...&room=demo
 | `fdn/web/src/exchange-health.ts` | 连续交换失败计数，决定何时判定数据面已死 |
 | `agent/internal/fdn/` | 公网边缘：静态资产 + 信令挂载 + 兜底反向代理 + 首次访问引导 |
 | `agent/internal/tunnel/` | WebRTC 隧道与请求转发（tunnelagent） |
+| `agent/internal/tunnel/mux.go` / `frame.go` | 多路复用服务端 / 与前端一致的帧协议 |
 | `agent/internal/relay/` | 路由表与反向代理，两边共用 |
 | `agent/internal/signaling/` | 信令服务端与客户端 |
 | `agent/cmd/fdn/` / `agent/cmd/tunnelagent/` | 两个入口 |
@@ -377,11 +442,12 @@ pnpm --dir fdn/web dev   # 打开 /?signal=...&room=demo
 
 | 限制 | 原因 / 说明 |
 | --- | --- |
-| **WebSocket 无法代理** | Service Worker 的 fetch 拦截只覆盖 HTTP，`/socket.io` 等实时推送走不了隧道。 |
+| **WebSocket 无法走隧道** | Service Worker 的 fetch 拦截只覆盖 HTTP，`/socket.io` 等实时推送经隧道走不了。它仍可用——回落路径会正常代理（fdn 的兜底支持 WebSocket 升级），只是不经 P2P。 |
 | **首次访问多等一次建链** | 冷浏览器没有 Service Worker，无法自己拦截。fdn 会把首次访问引导到连接页，建链完成后才进入站点（约 2 秒）。 |
 | **内网页面不能再建 PWA** | 一个 origin 只能有一个控制 scope `/` 的 Service Worker，已被本项目占用，内网应用自身的 PWA worker 需禁用。 |
 | **对称型 NAT 打洞失败** | 此时自动回落 fdn 的兜底反代；如需强制直连可自行部署 TURN。 |
-| **HttpOnly cookie 读不到** | 见「认证与会话」，把认证接口配置到 `neverTunnel`。 |
+| **SW 读不到任何浏览器 cookie** | Chromium 在 SW 的 fetch 事件里不提供 `Cookie` 头。隧道侧的会话必须由 Agent 自己持有（见「认证与会话」）。 |
+| **两端协议耦合** | `fdn` 与 `tunnelagent` 共用同一套帧协议，**升级必须同时进行**，否则隧道无法工作。 |
 
 ---
 
