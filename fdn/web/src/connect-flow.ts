@@ -82,6 +82,12 @@ export async function setOverlayEnabled(enabled: boolean): Promise<void> {
 export interface OverlayStatus {
   enabled: boolean;
   hasTransport: boolean;
+  /**
+   * False when the Service Worker did not answer within the deadline. Callers
+   * MUST NOT treat that as "the tunnel is dead": an unanswered query means we
+   * do not know, and acting on it tears down healthy connections.
+   */
+  answered: boolean;
 }
 
 export async function queryOverlayStatus(): Promise<OverlayStatus> {
@@ -89,13 +95,15 @@ export async function queryOverlayStatus(): Promise<OverlayStatus> {
   const sw = reg.active;
   if (!sw) throw new Error("service worker 未激活");
   return new Promise<OverlayStatus>((resolve) => {
-    const timer = setTimeout(() => resolve({ enabled: false, hasTransport: false }), 4000);
+    // No answer is NOT evidence of a dead tunnel: a busy or restarting Service
+    // Worker can miss the reply. Report "unknown" and let the caller decide.
+    const timer = setTimeout(() => resolve({ enabled: false, hasTransport: false, answered: false }), 4000);
     const handler = (event: MessageEvent) => {
       const d = event.data as { type?: string; enabled?: boolean; hasTransport?: boolean };
       if (d?.type === "overlay:status-reply") {
         clearTimeout(timer);
         navigator.serviceWorker.removeEventListener("message", handler);
-        resolve({ enabled: !!d.enabled, hasTransport: !!d.hasTransport });
+        resolve({ enabled: !!d.enabled, hasTransport: !!d.hasTransport, answered: true });
       }
     };
     navigator.serviceWorker.addEventListener("message", handler);

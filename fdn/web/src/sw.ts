@@ -76,6 +76,20 @@ let overlayEnabled = false;
 
 let portTransport: PortOverlayTransport | null = null;
 
+/**
+ * Drop the current data plane without asking anyone to reconnect.
+ *
+ * Used when a navigation is about to replace the document that owns the port:
+ * the old plane is gone by definition, so intercepting would only queue
+ * requests against a port that can never answer.
+ */
+function forgetDataPlane(): void {
+  portTransport?.dispose();
+  portTransport = null;
+  overlayEnabled = false;
+  exchangeHealth.reset();
+}
+
 function attachDataPlanePort(port: MessagePort): void {
   portTransport?.dispose();
   portTransport = new PortOverlayTransport(port);
@@ -269,6 +283,13 @@ self.addEventListener("fetch", (event: FetchEvent) => {
       return;
     }
     if (decision === "inject-holder") {
+      // A new document is about to replace the page that owned the current
+      // MessagePort. Chromium does not reliably fire MessagePort#onclose on
+      // unload, so without this the SW keeps believing the old plane is live
+      // and any request the new document fires on load sits on a dead port
+      // until the exchange timeout, then falls back. Invalidate it here so the
+      // first load after a redirect falls back immediately instead.
+      forgetDataPlane();
       event.respondWith(fetchWithHolder(event.request));
       return;
     }

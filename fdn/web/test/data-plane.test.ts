@@ -37,8 +37,29 @@ async function roundTrip(instance: OverlayInstanceLike, authority: string, reque
   const [pagePort, swPort] = portPair();
   attachDataPlane(pagePort, instance);
   const transport = new PortOverlayTransport(swPort);
+  // Traffic only flows once the page announced readiness; in production the SW
+  // refuses to enable the overlay before that point, so wait here rather than
+  // exercising a state the SW can never reach.
+  await transport.waitReady(2000);
   return transport.exchange(authority, new TextEncoder().encode(request));
 }
+
+describe("port transport readiness", () => {
+  it("rejects fast when the plane has not announced readiness", async () => {
+    const [pagePort, swPort] = portPair();
+    attachDataPlane(pagePort, { openChannel: () => new EchoChannel(new Uint8Array()) });
+    const transport = new PortOverlayTransport(swPort);
+    // No waitReady: this is what a request arriving while the holder is still
+    // connecting looked like. It must fail fast, not hang until the dead-port
+    // timeout (which is what made the first request after a connect-page
+    // redirect take ~25s before falling back).
+    const started = Date.now();
+    await expect(
+      transport.exchange("10.0.0.1:80", new TextEncoder().encode("GET / HTTP/1.1\r\n\r\n")),
+    ).rejects.toThrow(/not ready/);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+});
 
 describe("data plane exchange", () => {
   it("returns the peer's serialized response", async () => {

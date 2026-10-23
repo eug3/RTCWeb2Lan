@@ -19,7 +19,22 @@ interface Pending {
 }
 
 /** Hard cap for one exchange when the owning page died silently. */
-const DEAD_PORT_TIMEOUT_MS = 25_000;
+/**
+ * Upper bound on a single exchange on the message port.
+ *
+ * This is the safety net for a plane whose owner vanished: Chromium does not
+ * reliably fire MessagePort#onclose when the page holding the peer connection
+ * unloads, so the SW keeps a transport that reports isReady but can never
+ * answer. The common trigger is navigating from the connect page to the site:
+ * the new page's holder has not attached yet, the SW still believes the old
+ * plane is live, and the requests the app fires on load sit here until this
+ * timeout expires before falling back to the origin.
+ *
+ * A healthy exchange is tens of milliseconds, so a few seconds is generous
+ * while keeping that first-load stall short. (It was 25s, which is what made
+ * the first request after a redirect appear to hang.)
+ */
+const DEAD_PORT_TIMEOUT_MS = 3_000;
 
 export class PortOverlayTransport implements OverlayTransport {
   private nextId = 1;
@@ -87,6 +102,15 @@ export class PortOverlayTransport implements OverlayTransport {
   }
 
   exchange(authority: string, requestBytes: Uint8Array): Promise<Uint8Array> {
+    // Fail fast when the plane cannot possibly answer. Without this, a request
+    // that arrives while the holder is still connecting (e.g. immediately
+    // after the connect page redirects to the site) sat on the message port
+    // until the dead-port timeout fired — measured at ~25s before it finally
+    // fell back to the origin.
+    if (!this.isReady) {
+      return Promise.reject(new Error("data plane not ready"));
+    }
+
     const id = this.nextId++;
     const copy = requestBytes.slice();
     return new Promise<Uint8Array>((resolve, reject) => {

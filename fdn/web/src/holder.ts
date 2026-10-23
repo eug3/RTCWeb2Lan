@@ -24,6 +24,7 @@ import {
 } from "./connect-flow.js";
 import { applySetCookies } from "./cookie-relay.js";
 import { loadAndApplyConfig } from "./config-loader.js";
+import { decidePeerAction } from "./overlay-policy.js";
 import { DEFAULT_SITE_CONFIG, DEFAULT_SIGNALING_PROFILE, type SignalingProfile, type SiteProfile } from "./config.js";
 import type { PeerConnectionHandle } from "./peer.js";
 
@@ -66,10 +67,15 @@ async function ensureConnected(): Promise<void> {
   const status = await queryOverlayStatus();
   // "enabled" alone can be a stale SW state (the owning page died without the
   // port close event firing). Only a live transport means the tunnel is real.
-  if (status.enabled && status.hasTransport) return; // the tunnel is served — stand down
-
-  if (peer) {
-    // Orphaned peer (SW instance replaced): release it before reconnecting.
+  // An UNANSWERED status query means we do not know — not that the tunnel is
+  // dead. Killing the peer on a missed reply caused a reconnect storm: the
+  // holder built a healthy connection, failed to hear back within 4s, closed
+  // it, and rebuilt immediately, so requests queued behind a connection that
+  // never lived long enough to carry them. See overlay-policy.ts.
+  const action = decidePeerAction(status, peer !== null);
+  if (action === "stand-down" || action === "keep-peer") return;
+  if (action === "release-and-reconnect" && peer) {
+    // Explicitly reported down (SW instance replaced): release before reconnecting.
     peer.close();
     peer = null;
   }
