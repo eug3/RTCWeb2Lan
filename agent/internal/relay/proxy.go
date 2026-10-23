@@ -1,4 +1,4 @@
-package tunnel
+package relay
 
 import (
 	"crypto/tls"
@@ -18,11 +18,11 @@ type Target struct {
 	UpstreamSNI        string
 }
 
-// transport forwards a request to this target.
+// Transport forwards a request to this target.
 //
 // For https targets we send the configured SNI: that is what lets the agent
 // speak to a vhost behind nginx/Traefik that selects a site by TLS server name.
-func (t *Target) transport() http.RoundTripper {
+func (t *Target) Transport() http.RoundTripper {
 	base := http.DefaultTransport.(*http.Transport).Clone()
 	base.ForceAttemptHTTP2 = false
 

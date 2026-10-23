@@ -1,9 +1,0 @@
-# 路由表：公网 Host/路径 -> 内网真实服务
-# 实测依据（2026-10-21）：230:9011 直接返回 Sense；
-# 1号机 nginx 用 Host: sense.jshuaxin.net 反代到同一地址。
-routes:
-  # Sense：按域名整站路由（API 走 P2P，静态资源仍由 nginx 提供）
-  - name: sense
-    kind: host
-    host: sense.jshuaxin.net
-    target: http://10.1.1.230:9011

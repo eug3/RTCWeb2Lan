@@ -1,4 +1,6 @@
 node_modules/
+# 根目录无依赖，lockfile 由 pnpm 自动生成，不入库
+/pnpm-lock.yaml
 dist/
 # 构建产物：不要提交 tar 包
 dist.tar

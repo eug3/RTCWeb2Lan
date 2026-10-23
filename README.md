@@ -117,38 +117,40 @@ RTCWeb2Lan 用另一条路：
 
 ## 部署
 
-### 组件
+两个部署单元，各自一个镜像：
 
-| 组件 | 位置 | 职责 |
+| 单元 | 位置 | 职责 |
 | --- | --- | --- |
-| `web2lan-signal` + 静态资源 | 公网 | 信令 WebSocket（`/__lan/ws`）与前端静态页 |
-| `web2lan-agent` | 内网 | 出站连接信令（不监听端口），按路由表转发 HTTP 流量 |
-| 内网服务 | 内网 | 要被访问的应用本身，**零改造** |
+| **`fdn`**（front desk node） | 公网 | 静态资产 + 信令 + **内置兜底反代**，一个进程一个端口 |
+| **`tunnelagent`** | 内网 | 出站连信令、按路由表转发；不监听任何端口 |
 
-### 前端 + 信令
-
-```bash
-pnpm build
-tar -cf dist.tar -C dist .
-# 方式一：交给静态文件服务器
-cp -r dist/* /srv/web2lan/
-# 方式二：使用内置 -static（信令服务顺带托管静态文件）
-./web2lan-signal -addr :8787 -static /srv/web2lan
-```
-
-### 内网 Agent
+### fdn（公网边缘）
 
 ```bash
-cd agent
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o web2lan-agent ./cmd/web2lan-agent
+# 镜像
+docker build -f fdn/Dockerfile -t rtcweb2lan/fdn .
 
-scp web2lan-agent user@intranet-host:/opt/web2lan/
-ssh user@intranet-host "chmod +x /opt/web2lan/web2lan-agent && sudo systemctl restart web2lan-agent"
+# 运行：资产 + 信令 + 兜底反代共用 :8080
+docker run -d --name fdn -p 8080:8080 \
+  -v "$PWD/routes.yaml:/app/routes.yaml:ro" rtcweb2lan/fdn
 ```
 
-### Agent 路由表
+不传 `-routes` 时只提供资产与信令（兜底关闭）。兜底代理取代了原先的宿主机 nginx vhost，因此公网侧只需要这一个容器 + TLS 终止。
 
-Agent 用 `routes.yaml` 决定公网 Host 落到哪个内网服务（与前端 `config.json` 的 `routes` 对应）：
+### tunnelagent（内网）
+
+```bash
+docker build -f tunnelagent/Dockerfile -t rtcweb2lan/tunnelagent .
+
+docker run -d --name tunnelagent \
+  -v "$PWD/routes.yaml:/app/routes.yaml:ro" \
+  rtcweb2lan/tunnelagent \
+  -signal wss://edge.example.com/__lan/ws -room default -routes /app/routes.yaml
+```
+
+### 路由表
+
+两边都用同一份语义：公网 Host（或路径前缀）→ 内网目标。
 
 ```yaml
 routes:
@@ -158,27 +160,13 @@ routes:
     target: http://192.168.1.10:8080
 ```
 
-### 反向代理（回落路径）
+- `tunnelagent` 用它决定「隧道里的请求发给谁」；
+- `fdn` 用它决定「兜底时请求反代给谁」。
 
-公网 nginx 需要把两条路都准备好：
-
-```nginx
-server {
-  server_name app.example.com;
-
-  # 信令 + 连接页 + SW（走隧道容器）
-  location /__lan/ { proxy_pass http://127.0.0.1:8787; }
-
-  # 回落：与 API 同源，浏览器原生带 cookie
-  location /api/ { proxy_pass http://192.168.1.10:8080; }
-
-  location /     { root /srv/site; try_files $uri /index.html; }
-}
-```
-
-> 回落路径是**可用性底线**：P2P 失败时站点仍然完整可用，只是流量会经过公网。
+> 兜底是**可用性底线**：P2P 失败时站点仍然完整可用，只是流量会经过公网。
 
 ---
+
 
 ## 本地开发
 
@@ -194,11 +182,11 @@ pnpm run dev:stack # 一键本地栈：假内网服务 + 信令 + Agent + Web UI
 ### 对接真实环境
 
 ```bash
-pnpm run build:go   # 产出 .dev-bin/signal 与 .dev-bin/agent
+pnpm run build:go   # 产出 .dev-bin/fdn 与 .dev-bin/tunnelagent
 
-./.dev-bin/signal -addr 127.0.0.1:8787
-./.dev-bin/agent  -signal ws://127.0.0.1:8787/ws -room demo -routes routes.yaml
-npx vite --port 5273   # 打开 /?signal=...&room=demo
+./.dev-bin/fdn -addr 127.0.0.1:8787
+./.dev-bin/tunnelagent -signal ws://127.0.0.1:8787/__lan/ws -room demo -routes tunnelagent/routes.yaml
+pnpm --dir fdn/web dev   # 打开 /?signal=...&room=demo
 ```
 
 ---
@@ -207,20 +195,21 @@ npx vite --port 5273   # 打开 /?signal=...&room=demo
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/config.ts` | 配置契约、默认值、规范化、路由判定（`shouldTunnel` / `pathMatchesPrefix`） |
-| `src/config-loader.ts` | 加载 `config.json` 并推送给 Service Worker |
-| `src/sw.ts` | fetch 拦截、导航门控、隧道交换、失败自愈、Set-Cookie 转发 |
-| `src/nav-gate.ts` | `/` 的导航决策（连接页 / 注入 holder / 直通）与 holder 注入 |
-| `src/connect.html` `src/connect.ts` | 连接页：注册 SW、建链重试、跳转 |
-| `src/holder.html` `src/holder.ts` | 常驻 iframe：持有/重连数据面、健康检查、落地 Cookie |
-| `src/connect-flow.ts` | 建链流程（信令 → ICE → 接入 → 验证）与 SW 控制消息 |
-| `src/peer.ts` | RTCPeerConnection 封装（发起/应答、通道工厂） |
-| `src/channel.ts` | 单通道收发约定（16KiB-1 分片、空消息 EOF、背压） |
-| `src/data-plane.ts` | 页面侧数据面：交换队列与重试 |
-| `src/port-transport.ts` | SW ↔ 页面 MessagePort 传输（含死端口超时） |
-| `src/http1.ts` / `src/router.ts` | HTTP/1.1 增量编解码 / Host + 前缀路由 |
-| `src/cookie-relay.ts` | Set-Cookie → `document.cookie` 转换（剥 HttpOnly） |
-| `agent/` | Go：信令服务器与内网 Agent（pion/webrtc） |
+| `fdn/web/src/config.ts` | 配置契约、默认值、规范化、路由判定（`shouldTunnel` / `pathMatchesPrefix`） |
+| `fdn/web/src/config-loader.ts` | 加载 `config.json` 并推送给 Service Worker |
+| `fdn/web/src/sw.ts` | fetch 拦截、导航门控、隧道交换、失败自愈、Set-Cookie 转发 |
+| `fdn/web/src/nav-gate.ts` | `/` 的导航决策（连接页 / 注入 holder / 直通）与 holder 注入 |
+| `fdn/web/src/connect.*` / `holder.*` | 连接页（建链重试、跳转）/ 常驻 iframe（持有数据面、健康检查、落 Cookie） |
+| `fdn/web/src/connect-flow.ts` | 建链流程（信令 → ICE → 接入 → 验证）与 SW 控制消息 |
+| `fdn/web/src/peer.ts` / `channel.ts` | RTCPeerConnection 封装 / 单通道收发约定（分片、空消息 EOF、背压） |
+| `fdn/web/src/data-plane.ts` / `port-transport.ts` | 页面侧数据面 / SW ↔ 页面 MessagePort 传输 |
+| `fdn/web/src/http1.ts` / `router.ts` | HTTP/1.1 增量编解码 / Host + 前缀路由 |
+| `fdn/web/src/cookie-relay.ts` | Set-Cookie → `document.cookie` 转换（剥 HttpOnly） |
+| `agent/internal/fdn/` | 公网边缘：静态资产 + 信令挂载 + 兜底反向代理 |
+| `agent/internal/tunnel/` | WebRTC 隧道与请求转发（tunnelagent） |
+| `agent/internal/relay/` | 路由表与反向代理，两边共用 |
+| `agent/internal/signaling/` | 信令服务端与客户端 |
+| `agent/cmd/fdn/` / `agent/cmd/tunnelagent/` | 两个入口 |
 
 ---
 
@@ -229,9 +218,9 @@ npx vite --port 5273   # 打开 /?signal=...&room=demo
 | 限制 | 原因 / 说明 |
 | --- | --- |
 | **WebSocket 无法代理** | Service Worker 的 fetch 拦截只覆盖 HTTP，`/socket.io` 等实时推送走不了隧道。 |
-| **首次访问的鸡生蛋** | 冷浏览器第一次访问 `/` 时还没有 Service Worker，只能看到 nginx 版站点；需要先访问一次连接页。 |
+| **首次访问的鸡生蛋** | 冷浏览器第一次访问 `/` 时还没有 Service Worker，只能看到兜底反代的站点；需要先访问一次连接页。 |
 | **内网页面不能再建 PWA** | 一个 origin 只能有一个控制 scope `/` 的 Service Worker，已被本项目占用，内网应用自身的 PWA worker 需禁用。 |
-| **对称型 NAT 打洞失败** | 此时自动回落 nginx；如需强制直连可自行部署 TURN。 |
+| **对称型 NAT 打洞失败** | 此时自动回落 fdn 的兜底反代；如需强制直连可自行部署 TURN。 |
 | **HttpOnly cookie 读不到** | 见「认证与会话」，把认证接口配置到 `neverTunnel`。 |
 
 ---

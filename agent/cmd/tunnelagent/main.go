@@ -1,16 +1,17 @@
-// Command web2lan-agent exposes intranet HTTP services to a browser over WebRTC.
+// Command tunnelagent exposes intranet HTTP services to a browser over WebRTC.
 //
-// The agent dials the public signaling relay (discovery only), waits for a
-// browser offer, answers it, and then proxies each request received on the
-// "http" DataChannel to whichever intranet service the route table selects.
+// It dials the public signaling service (discovery only), waits for a browser
+// offer, answers it, and then proxies each request received on the "http"
+// DataChannel to whichever intranet service the route table selects. It never
+// listens on a port: all traffic is outbound.
 //
 // One agent serves many sites:
 //
-//	web2lan-agent -signal ws://127.0.0.1:8787/ws -room lan -routes routes.yaml
+//	tunnelagent -signal wss://edge.example.com/__lan/ws -room default -routes routes.yaml
 //
 // A single-target shortcut is kept for quick tests:
 //
-//	web2lan-agent -room demo -target http://10.1.1.230:9011
+//	tunnelagent -room demo -target http://192.168.1.10:8080
 package main
 
 import (
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	"github.com/beijihu/easytier-web2lan/agent/internal/protocol"
+	"github.com/beijihu/easytier-web2lan/agent/internal/relay"
 	"github.com/beijihu/easytier-web2lan/agent/internal/signaling"
 	"github.com/beijihu/easytier-web2lan/agent/internal/tunnel"
 	"github.com/pion/webrtc/v4"
@@ -48,7 +50,7 @@ func main() {
 	)
 	flag.Parse()
 
-	logger := log.New(os.Stderr, "[web2lan-agent] ", log.LstdFlags|log.Lmicroseconds)
+	logger := log.New(os.Stderr, "[tunnelagent] ", log.LstdFlags|log.Lmicroseconds)
 
 	routes, err := loadRoutes(*routesPath, *target, *insecure)
 	if err != nil {
@@ -103,14 +105,14 @@ func main() {
 }
 
 // loadRoutes builds the route table from either a YAML file or -target.
-func loadRoutes(path, target string, insecure bool) (*tunnel.RouteTable, error) {
+func loadRoutes(path, target string, insecure bool) (*relay.RouteTable, error) {
 	if path != "" {
-		return tunnel.LoadRoutes(path, insecure)
+		return relay.LoadRoutes(path, insecure)
 	}
 	if target == "" {
 		return nil, errors.New("either -routes or -target is required")
 	}
-	return tunnel.SingleRoute(target, insecure)
+	return relay.SingleRoute(target, insecure)
 }
 
 func splitList(s string) []string {
@@ -128,7 +130,7 @@ func run(
 	ctx context.Context,
 	logger *log.Logger,
 	signalURL, room, secret string,
-	routes *tunnel.RouteTable,
+	routes *relay.RouteTable,
 	webrtcConfig webrtc.Configuration,
 	advertiseNet *net.IPNet,
 ) error {

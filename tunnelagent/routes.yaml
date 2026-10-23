@@ -1,0 +1,21 @@
+# 路由表：公网 Host / 路径前缀 -> 内网真实服务
+#
+# 同一份语义两边都用：
+#   tunnelagent 用它决定「隧道里的请求发给谁」
+#   fdn         用它决定「兜底时请求反代给谁」
+#
+# 这是**模板**。真实部署时用 -routes 指向你自己的文件，或把本文件挂载覆盖：
+#   docker run -v /path/to/real-routes.yaml:/app/routes.yaml:ro ...
+#
+# 字段：
+#   kind   "host"（整站路由）或 "prefix"（路径前缀路由，转发时剥掉前缀）
+#   host   公网域名
+#   prefix 仅 kind=prefix 使用
+#   target 内网目标，含 scheme，如 http://192.168.1.10:8080
+#
+# 可选：insecure_tls: true（跳过上游证书校验）、upstream_sni: <name>
+routes:
+  - name: example
+    kind: host
+    host: app.example.com
+    target: http://192.168.1.10:8080

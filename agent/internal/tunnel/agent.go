@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/beijihu/easytier-web2lan/agent/internal/relay"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -32,7 +33,7 @@ const MTU = 16*1024 - 1
 // Agent owns one PeerConnection and its tunnels.
 type Agent struct {
 	log    *log.Logger
-	routes *RouteTable
+	routes *relay.RouteTable
 	pc     *webrtc.PeerConnection
 
 	mu      sync.Mutex
@@ -50,7 +51,7 @@ type Agent struct {
 // external browsers keep a path in.
 func New(
 	cfg webrtc.Configuration,
-	routes *RouteTable,
+	routes *relay.RouteTable,
 	advertiseCIDR *net.IPNet,
 	onCandidate func(webrtc.ICECandidateInit),
 	logger *log.Logger,
@@ -268,7 +269,7 @@ func queryString(u *url.URL) string {
 
 // httpClient builds a client with a per-target cookie jar.
 // Cookies cannot be managed from a Service Worker, so they are kept here.
-func (a *Agent) httpClient(target *Target) *http.Client {
+func (a *Agent) httpClient(target *relay.Target) *http.Client {
 	a.mu.Lock()
 	jar, ok := a.jars[target.URL.String()]
 	if !ok {
@@ -279,7 +280,7 @@ func (a *Agent) httpClient(target *Target) *http.Client {
 
 	return &http.Client{
 		Jar:       jar,
-		Transport: target.transport(),
+		Transport: target.Transport(),
 		// Never follow redirects here: the browser decides, which keeps address
 		// semantics identical to a direct visit.
 		CheckRedirect: func(*http.Request, []*http.Request) error {

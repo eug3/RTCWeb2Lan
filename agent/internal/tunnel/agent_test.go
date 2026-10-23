@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/beijihu/easytier-web2lan/agent/internal/relay"
 	"github.com/beijihu/easytier-web2lan/agent/internal/tunnel"
 	"github.com/pion/webrtc/v4"
 )
@@ -26,7 +27,7 @@ func startTarget(t *testing.T) *httptest.Server {
 }
 
 // exchange drives one request through a real PeerConnection into the agent.
-func exchange(t *testing.T, routes *tunnel.RouteTable, request string) string {
+func exchange(t *testing.T, routes *relay.RouteTable, request string) string {
 	t.Helper()
 
 	browser, err := webrtc.NewPeerConnection(webrtc.Configuration{})
@@ -116,7 +117,7 @@ func exchange(t *testing.T, routes *tunnel.RouteTable, request string) string {
 
 func TestAgentProxiesSingleTarget(t *testing.T) {
 	target := startTarget(t)
-	routes, err := tunnel.SingleRoute(target.URL, false)
+	routes, err := relay.SingleRoute(target.URL, false)
 	if err != nil {
 		t.Fatalf("single route: %v", err)
 	}
@@ -135,7 +136,7 @@ func TestAgentRoutesByHost(t *testing.T) {
 	sense := startTarget(t)
 	gate := startTarget(t)
 
-	routes, err := tunnel.NewTableForTest([]tunnel.RouteSpec{
+	routes, err := relay.NewTableForTest([]relay.RouteSpec{
 		{Kind: "host", Host: "sense.jshuaxin.net", Target: sense.URL},
 		{Kind: "host", Host: "gate.example.com", Target: gate.URL},
 	}, false)
@@ -158,7 +159,7 @@ func TestAgentRoutesByHost(t *testing.T) {
 
 func TestAgentReturns404ForUnknownHost(t *testing.T) {
 	target := startTarget(t)
-	routes, err := tunnel.NewTableForTest([]tunnel.RouteSpec{
+	routes, err := relay.NewTableForTest([]relay.RouteSpec{
 		{Kind: "host", Host: "known.example.com", Target: target.URL},
 	}, false)
 	if err != nil {

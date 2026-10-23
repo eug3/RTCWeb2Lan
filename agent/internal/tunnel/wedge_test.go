@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/beijihu/easytier-web2lan/agent/internal/relay"
 	"github.com/beijihu/easytier-web2lan/agent/internal/tunnel"
 	"github.com/pion/webrtc/v4"
 )
@@ -25,7 +26,7 @@ func newAgentPeer(t *testing.T) *webrtc.PeerConnection {
 		_, _ = io.WriteString(w, "{}")
 	}))
 	t.Cleanup(srv.Close)
-	routes, err := tunnel.SingleRoute(srv.URL, false)
+	routes, err := relay.SingleRoute(srv.URL, false)
 	if err != nil {
 		t.Fatalf("route: %v", err)
 	}

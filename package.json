@@ -1,24 +1,17 @@
 {
-  "name": "easytier-web2lan",
+  "name": "rtcweb2lan",
   "version": "0.1.0",
   "private": true,
-  "type": "module",
   "description": "Access intranet web apps from any browser with an unchanged URL: Service Worker interception over a peer-to-peer WebRTC DataChannel, no intranet app changes.",
   "scripts": {
-    "dev": "vite --port 5273 --host 127.0.0.1",
+    "build": "pnpm --dir fdn/web build && pnpm run build:go",
+    "build:web": "pnpm --dir fdn/web build",
+    "build:go": "cd agent && go build -o ../.dev-bin/fdn ./cmd/fdn && go build -o ../.dev-bin/tunnelagent ./cmd/tunnelagent",
+    "dev": "pnpm --dir fdn/web dev",
     "dev:stack": "bash scripts/dev-stack.sh",
-    "build": "tsc --noEmit && vite build",
-    "preview": "vite preview --port 5273 --host 127.0.0.1",
-    "test": "vitest run",
-    "typecheck": "tsc --noEmit",
-    "e2e": "node scripts/e2e-port.mjs",
-    "e2e:rtc": "node scripts/e2e-webrtc.mjs",
+    "test": "pnpm --dir fdn/web test",
     "test:go": "cd agent && go test ./...",
-    "build:go": "cd agent && go build -o ../../.dev-bin/agent ./cmd/web2lan-agent && go build -o ../../.dev-bin/signal ./cmd/web2lan-signal"
-  },
-  "devDependencies": {
-    "typescript": "^5.6.0",
-    "vite": "^6.0.0",
-    "vitest": "^2.1.0"
+    "typecheck": "pnpm --dir fdn/web typecheck",
+    "check": "pnpm typecheck && pnpm test && pnpm run test:go"
   }
 }
