@@ -1,16 +1,13 @@
 // Package tunnel implements the intranet side of the WebRTC tunnel.
 //
-// For each HTTP request the browser opens a fresh DataChannel labelled "http".
-// This agent reads the serialized HTTP/1.1 request, resolves it against a route
-// table, proxies it to the matching intranet service, and writes the response
-// back. One agent therefore serves many intranet sites.
+// The browser opens ONE DataChannel labelled "http" and multiplexes every HTTP
+// request over it (see mux.go). This agent demultiplexes them, resolves each
+// against a route table, proxies it to the matching intranet service, and
+// writes the response back. One agent therefore serves many intranet sites.
 package tunnel
 
 import (
-	"bufio"
-	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -18,7 +15,6 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/beijihu/easytier-web2lan/agent/internal/relay"
 	"github.com/pion/webrtc/v4"
@@ -38,6 +34,7 @@ type Agent struct {
 
 	mu      sync.Mutex
 	relayed bool
+	mux     *muxConn
 	jars    map[string]http.CookieJar // one jar per target
 }
 
@@ -159,82 +156,53 @@ func (a *Agent) IsRelayed() bool {
 // Close shuts the peer connection down.
 func (a *Agent) Close() error { return a.pc.Close() }
 
-// serveChannel handles exactly one HTTP request/response over one DataChannel.
+// serveChannel starts the multiplexer for a DataChannel.
 //
-// The OnMessage handler is registered here, synchronously, the moment pion
-// hands us the channel. The blocking request/response work is then run in a
-// goroutine so pion's accept loop is not held up. Registering before the
-// read loop starts is what prevents the first-fragment drop that produced the
-// "channel opens but no request arrives" wedge.
+// ONE channel now carries every exchange (see mux.go): opening a channel per
+// request meant each request depended on a fresh DCEP handshake that Chrome and
+// pion frequently never completed, and stream resets poisoned later streams on
+// the same association. The OnMessage handler is registered synchronously,
+// before pion's read loop starts, or the first fragment is silently dropped.
 func (a *Agent) serveChannel(dc *webrtc.DataChannel) {
-	reader, writer := io.Pipe()
-	// Do NOT close the DataChannel after responding: resetting an SCTP
-	// stream right after a large transfer wedges every stream opened later on
-	// the same association (verified: 2nd MB-sized transfer always died).
-	// Channels are reclaimed when the peer connection closes; the per-request
-	// leak is bounded by the page lifetime (SCTP allows 65535 streams).
-	defer func() {
-		// reader is closed by the goroutine's defer below once it is done; this
-		// outer defer only guards against a handler that never runs.
-	}()
-
-	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		if len(msg.Data) == 0 {
-			_ = writer.Close() // end of request
-			return
-		}
-		if _, err := writer.Write(msg.Data); err != nil {
-			a.log.Printf("write to pipe: %v", err)
-			_ = dc.Close()
-		}
-	})
-
-	go a.handleRequest(dc, reader, writer)
+	m := newMuxConn(dc, a.log, a.proxy)
+	a.mu.Lock()
+	a.mux = m
+	a.mu.Unlock()
 }
 
-// handleRequest reads one HTTP request off the channel's request stream,
-// proxies it, and writes the response back. It runs off pion's accept path.
-func (a *Agent) handleRequest(dc *webrtc.DataChannel, reader *io.PipeReader, writer *io.PipeWriter) {
-	defer func() { _ = reader.Close() }()
-
-	// A wedged SCTP stream opens the channel but never delivers the request
-	// bytes; without a deadline the browser-side retry (fresh channel) could
-	// never take over because this read would block forever.
-	readTimer := time.AfterFunc(15*time.Second, func() {
-		_ = writer.CloseWithError(errors.New("request read timeout"))
-		_ = dc.Close()
-	})
-	req, err := http.ReadRequest(bufio.NewReader(reader))
-	readTimer.Stop()
-	if err != nil {
-		a.log.Printf("read request: %v", err)
-		return
-	}
-	req.RequestURI = ""
-	defer func() { _ = req.Body.Close() }()
-
+// proxy forwards one request to the routed intranet target.
+func (a *Agent) proxy(req *http.Request) (*http.Response, error) {
 	host := stripPort(req.Host)
 	target, upstreamPath, ok := a.routes.Match(host, req.URL.Path)
 	if !ok {
 		a.log.Printf("no route: host=%s path=%s", host, req.URL.Path)
-		a.writeSimple(dc, http.StatusNotFound, "no route for "+host+req.URL.Path)
-		return
+		return simpleResponse(http.StatusNotFound, "no route for "+host+req.URL.Path), nil
 	}
 
 	req.URL.Path = upstreamPath
 	a.log.Printf("%s %s%s -> %s", req.Method, req.URL.Path, queryString(req.URL), target.URL)
 
-	resp, err := a.httpClient(target).Do(req)
+	// Give the request an absolute URL before handing it to the client.
+	//
+	// http.ReadRequest leaves req.URL relative (only the path); the host lives
+	// in req.Host. http.Client applies the cookie jar by looking up
+	// jar.Cookies(req.URL), so with a relative URL the lookup has no host to
+	// match and always returns nothing — the agent's jar silently never
+	// contributed a cookie, which made every tunnelled request look logged out
+	// even after a successful login over the tunnel.
+	//
+	// The scheme/host here only drive the jar lookup; Transport rewrites them to
+	// the real target afterwards.
+	req.URL.Scheme = "http"
+	req.URL.Host = req.Host
+
+	client := a.httpClient(target)
+	resp, err := client.Do(req)
 	if err != nil {
 		a.log.Printf("proxy request: %v", err)
-		a.writeSimple(dc, http.StatusBadGateway, "upstream error: "+err.Error())
-		return
+		return simpleResponse(http.StatusBadGateway, "upstream error: "+err.Error()), nil
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if err := writeResponse(dc, resp); err != nil {
-		a.log.Printf("write response: %v", err)
-	}
+	return resp, nil
 }
 
 func stripPort(hostport string) string {
@@ -242,22 +210,6 @@ func stripPort(hostport string) string {
 		return hostport[:i]
 	}
 	return hostport
-}
-
-func (a *Agent) writeSimple(dc *webrtc.DataChannel, status int, body string) {
-	resp := &http.Response{
-		StatusCode:    status,
-		Status:        fmt.Sprintf("%d %s", status, http.StatusText(status)),
-		Proto:         "HTTP/1.1",
-		ProtoMajor:    1,
-		ProtoMinor:    1,
-		Header:        http.Header{"Content-Type": {"text/plain; charset=utf-8"}},
-		Body:          io.NopCloser(strings.NewReader(body)),
-		ContentLength: int64(len(body)),
-	}
-	if err := writeResponse(dc, resp); err != nil {
-		a.log.Printf("write simple response: %v", err)
-	}
 }
 
 func queryString(u *url.URL) string {
@@ -287,60 +239,4 @@ func (a *Agent) httpClient(target *relay.Target) *http.Client {
 			return http.ErrUseLastResponse
 		},
 	}
-}
-
-// writeResponse fragments the serialized response, then sends the empty
-// end-of-message marker.
-//
-// Sends are backpressured on the SCTP buffer amount: without a cap a burst of
-// multi-megabyte responses makes pion buffer unboundedly, and the association
-// degrades to a wedge after a couple of transfers.
-const maxSendBuffered = 1 * 1024 * 1024
-
-func writeResponse(dc *webrtc.DataChannel, resp *http.Response) error {
-	pr, pw := io.Pipe()
-
-	errCh := make(chan error, 1)
-	go func() {
-		bw := bufio.NewWriterSize(pw, MTU)
-		err := resp.Write(bw)
-		if err == nil {
-			err = bw.Flush()
-		}
-		_ = pw.CloseWithError(err)
-		errCh <- err
-	}()
-
-	buf := make([]byte, MTU)
-	var sendErr error
-	for {
-		n, err := pr.Read(buf)
-		if n > 0 {
-			// Let the SCTP layer drain before queueing the next chunk.
-			for dc.BufferedAmount() > maxSendBuffered {
-				time.Sleep(5 * time.Millisecond)
-			}
-			if e := dc.Send(buf[:n]); e != nil {
-				sendErr = e
-				_ = pr.Close()
-				break
-			}
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			sendErr = err
-			break
-		}
-	}
-	_ = pr.Close()
-
-	if err := <-errCh; err != nil && sendErr == nil {
-		return err
-	}
-	if sendErr != nil {
-		return sendErr
-	}
-	return dc.Send(nil)
 }

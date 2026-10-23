@@ -78,43 +78,76 @@ func newAgentPeer(t *testing.T) *webrtc.PeerConnection {
 // exchangeOn opens a fresh DataChannel (as the browser does per request),
 // sends the given payload fragmented at the DataChannel MTU, and waits for the
 // response end marker. Returns true on success.
-func exchangeOn(browser *webrtc.PeerConnection, payload []byte, timeout time.Duration) bool {
-	const mtu = 16*1024 - 1
+// muxHarness drives many concurrent exchanges over ONE DataChannel, matching
+// how the browser now talks to the agent (see mux.go).
+type muxHarness struct {
+	dc *webrtc.DataChannel
+
+	mu      sync.Mutex
+	streams map[uint32]chan []byte
+	next    uint32
+}
+
+func newMuxHarness(t *testing.T, browser *webrtc.PeerConnection) *muxHarness {
+	t.Helper()
 	dc, err := browser.CreateDataChannel(tunnel.ChannelLabel, nil)
 	if err != nil {
-		return false
+		t.Fatalf("create data channel: %v", err)
 	}
-	opened := make(chan struct{})
-	dc.OnOpen(func() { close(opened) })
-	select {
-	case <-opened:
-	case <-time.After(5 * time.Second):
-		return false
-	}
-	done := make(chan struct{})
+	h := &muxHarness{dc: dc, streams: make(map[uint32]chan []byte), next: 1}
+
 	dc.OnMessage(func(m webrtc.DataChannelMessage) {
-		if len(m.Data) == 0 {
-			close(done)
+		kind, id, payload, err := tunnel.DecodeFrame(m.Data)
+		if err != nil {
+			return
+		}
+		h.mu.Lock()
+		ch := h.streams[id]
+		h.mu.Unlock()
+		if ch == nil {
+			return
+		}
+		switch kind {
+		case tunnel.KindData:
+			ch <- append([]byte(nil), payload...)
+		case tunnel.KindEnd, tunnel.KindAbort:
+			close(ch)
 		}
 	})
-	for off := 0; off < len(payload); off += mtu {
-		end := off + mtu
-		if end > len(payload) {
-			end = len(payload)
-		}
-		if err := dc.Send(payload[off:end]); err != nil {
+	return h
+}
+
+// exchange runs one request over the shared channel.
+func (h *muxHarness) exchange(payload []byte, timeout time.Duration) bool {
+	h.mu.Lock()
+	id := h.next
+	h.next++
+	ch := make(chan []byte, 512)
+	h.streams[id] = ch
+	h.mu.Unlock()
+
+	for _, piece := range tunnel.FragmentPayload(payload) {
+		if err := h.dc.Send(tunnel.EncodeFrame(tunnel.KindData, id, piece)); err != nil {
 			return false
 		}
-		for dc.BufferedAmount() > 1<<20 {
+		for h.dc.BufferedAmount() > 1<<20 {
 			time.Sleep(2 * time.Millisecond)
 		}
 	}
-	_ = dc.Send(nil)
-	select {
-	case <-done:
-		return true
-	case <-time.After(timeout):
+	if err := h.dc.Send(tunnel.EncodeFrame(tunnel.KindEnd, id, nil)); err != nil {
 		return false
+	}
+
+	deadline := time.After(timeout)
+	for {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				return true
+			}
+		case <-deadline:
+			return false
+		}
 	}
 }
 
@@ -124,6 +157,7 @@ func exchangeOn(browser *webrtc.PeerConnection, payload []byte, timeout time.Dur
 // starts). Many channels are opened back-to-back and must all be served.
 func TestNoChannelOpenWedge(t *testing.T) {
 	browser := newAgentPeer(t)
+	h := newMuxHarness(t, browser)
 	const n = 30
 	const rounds = 3
 	req := []byte("GET /small HTTP/1.1\r\nHost: a.example.com\r\n\r\n")
@@ -135,7 +169,7 @@ func TestNoChannelOpenWedge(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				if !exchangeOn(browser, req, 6*time.Second) {
+				if !h.exchange(req, 15*time.Second) {
 					mu.Lock()
 					fail++
 					mu.Unlock()
@@ -153,6 +187,7 @@ func TestNoChannelOpenWedge(t *testing.T) {
 // a slow large upload must not starve the other channels.
 func TestConcurrentLargeAndSmall(t *testing.T) {
 	browser := newAgentPeer(t)
+	h := newMuxHarness(t, browser)
 	big := bytes.Repeat([]byte("x"), 400*1024)
 	const n = 12
 	var wg sync.WaitGroup
@@ -168,7 +203,7 @@ func TestConcurrentLargeAndSmall(t *testing.T) {
 			} else {
 				payload = []byte("GET /small HTTP/1.1\r\nHost: a.example.com\r\n\r\n")
 			}
-			if !exchangeOn(browser, payload, 15*time.Second) {
+			if !h.exchange(payload, 30*time.Second) {
 				mu.Lock()
 				fail++
 				mu.Unlock()

@@ -1,18 +1,25 @@
 /**
  * Page-side data plane.
  *
- * Owns whatever actually reaches the intranet (WebRTC DataChannel, or a stand-in
- * in tests) and answers "exchange" requests from the Service Worker.
+ * Owns whatever actually reaches the intranet and answers "exchange" requests
+ * from the Service Worker.
  *
- * Each exchange opens a fresh DataChannel, sends the serialized request, and
- * collects the serialized response until the peer's empty end-of-message marker.
+ * All exchanges share ONE DataChannel and are multiplexed by stream id (see
+ * mux.ts). Opening a channel per request used to be simpler, but every request
+ * then depended on a fresh DCEP handshake that Chrome and pion often never
+ * completed, so in practice almost nothing went through the tunnel and the
+ * overlay silently degraded to the fallback proxy.
+ *
+ * Exchanges are still serialised for the SW's benefit: HTTP requests arrive
+ * seconds apart, and keeping one in flight at a time means a wedged stream
+ * cannot starve the others behind it.
  */
 
-import { createChannelSender, type DataChannelLike } from "./channel.js";
+import { MuxClient, type DataChannelLike } from "./mux-client.js";
 import type { PeerConnectionHandle } from "./peer.js";
 
 export interface OverlayInstanceLike {
-  /** Open a channel for one request. */
+  /** The single multiplexed channel for this peer connection. */
   openChannel(): DataChannelLike;
 }
 
@@ -30,15 +37,17 @@ export function attachDataPlane(
 ): () => void {
   const exchangeTimeoutMs = options.exchangeTimeoutMs ?? DEFAULT_EXCHANGE_TIMEOUT_MS;
   let disposed = false;
+  let mux: MuxClient | null = null;
 
   const post = (msg: unknown) => {
     if (!disposed) port.postMessage(msg);
   };
 
-  // Concurrent exchanges on one peer connection intermittently wedge
-  // (one channel's transfer stalls the others in the SCTP layer). Requests are
-  // seconds apart in practice, so a serial queue costs nothing and removes the
-  // failure mode entirely.
+  const getMux = (): MuxClient => {
+    if (!mux) mux = new MuxClient(instance.openChannel());
+    return mux;
+  };
+
   let queue: Promise<void> = Promise.resolve();
 
   port.onmessage = (event: MessageEvent) => {
@@ -46,13 +55,13 @@ export function attachDataPlane(
     if (!msg || msg.t !== "exchange") return;
 
     const id = msg.id;
-    const authority = String(msg.authority);
     const requestBytes = new Uint8Array(msg.bytes as ArrayBuffer);
 
     queue = queue.then(() =>
       disposed
         ? undefined
-        : runExchange(instance, requestBytes, exchangeTimeoutMs)
+        : getMux()
+            .exchange(requestBytes, exchangeTimeoutMs)
             .then((bytes) => {
               post({ t: "result", id, bytes: bytes.buffer });
             })
@@ -60,8 +69,6 @@ export function attachDataPlane(
               post({ t: "error", id, message: error instanceof Error ? error.message : String(error) });
             }),
     );
-
-    void authority;
   };
 
   port.start();
@@ -69,47 +76,26 @@ export function attachDataPlane(
 
   return () => {
     disposed = true;
+    mux?.close();
+    mux = null;
   };
 }
 
 /**
- * Wedged SCTP streams open but never deliver a single byte. Detection is a
- * short first-chunk budget (well above the LAN RTT); each attempt then retries
- * on a fresh channel. Attempts are capped so a truly dead connection surfaces.
+ * Run one exchange directly over the peer connection, bypassing the SW and the
+ * message port. Used to verify a freshly built tunnel.
  */
-const FIRST_CHUNK_BUDGET_MS = 2_000;
-const MAX_ATTEMPTS = 5;
-
 export async function runExchange(
   instance: OverlayInstanceLike,
   requestBytes: Uint8Array,
   timeoutMs: number,
 ): Promise<Uint8Array> {
-  let lastError: unknown = new Error("exchange never ran");
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const channel = instance.openChannel();
-    const sender = createChannelSender(channel);
-    let delivered = false;
-    try {
-      await sender.sendAll(requestBytes);
-      const out = await sender.receiveAll(timeoutMs, FIRST_CHUNK_BUDGET_MS);
-      delivered = true;
-      return out;
-    } catch (error) {
-      lastError = error;
-      console.warn(
-        "[data-plane] attempt", attempt + "/" + MAX_ATTEMPTS, "failed:",
-        error instanceof Error ? error.message : String(error),
-      );
-    } finally {
-      // Closing a channel right after its transfer resets the SCTP stream and
-      // poisons later streams on the same association (see agent.go). Failed
-      // attempts must still close; successful channels are reclaimed when the
-      // peer connection goes away.
-      if (!delivered) sender.close();
-    }
+  const mux = new MuxClient(instance.openChannel());
+  try {
+    return await mux.exchange(requestBytes, timeoutMs);
+  } finally {
+    mux.close();
   }
-  throw lastError;
 }
 
 /** Convenience: build a data plane instance from a peer connection handle. */

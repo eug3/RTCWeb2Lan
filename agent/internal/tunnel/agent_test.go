@@ -77,21 +77,33 @@ func exchange(t *testing.T, routes *relay.RouteTable, request string) string {
 		t.Fatal("data channel did not open within 25s (ICE failed)")
 	}
 
-	chunks := make(chan []byte, 64)
+	// One channel carries every exchange, multiplexed by stream id.
+	const stream = 1
+	chunks := make(chan []byte, 256)
 	done := make(chan struct{})
 	dc.OnMessage(func(m webrtc.DataChannelMessage) {
-		if len(m.Data) == 0 {
-			close(done)
+		kind, id, payload, err := tunnel.DecodeFrame(m.Data)
+		if err != nil || id != stream {
 			return
 		}
-		chunks <- append([]byte(nil), m.Data...)
+		switch kind {
+		case tunnel.KindData:
+			chunks <- append([]byte(nil), payload...)
+		case tunnel.KindEnd:
+			close(done)
+		case tunnel.KindAbort:
+			t.Errorf("peer aborted stream: %s", payload)
+			close(done)
+		}
 	})
 
-	if err := dc.Send([]byte(request)); err != nil {
-		t.Fatalf("send request: %v", err)
+	for _, piece := range tunnel.FragmentPayload([]byte(request)) {
+		if err := dc.Send(tunnel.EncodeFrame(tunnel.KindData, stream, piece)); err != nil {
+			t.Fatalf("send request frame: %v", err)
+		}
 	}
-	if err := dc.Send(nil); err != nil {
-		t.Fatalf("send end marker: %v", err)
+	if err := dc.Send(tunnel.EncodeFrame(tunnel.KindEnd, stream, nil)); err != nil {
+		t.Fatalf("send end frame: %v", err)
 	}
 
 	var resp []byte
