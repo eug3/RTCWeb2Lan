@@ -42,6 +42,15 @@ func Dial(ctx context.Context, baseURL, room, secret string, logger *log.Logger)
 		return nil, fmt.Errorf("dial signaling: %w", err)
 	}
 
+	// Notice a silently dead connection. The relay pings every 20s; a missing
+	// pong must eventually become a read error, otherwise the agent believes it
+	// still holds a slot that NAT dropped long ago.
+	const pongWait = 75 * time.Second
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+
 	c := &Client{conn: conn, log: logger}
 
 	hello := protocol.New(protocol.TypeHello, room)

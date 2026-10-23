@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -207,6 +208,18 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	peer := &Peer{conn: conn, role: role}
 
+	// Keep the connection warm and notice when the far end dies. A pong is
+	// answered automatically by the gorilla read loop; the deadline below is
+	// what turns "no pong" into an actual read error.
+	done := make(chan struct{})
+	defer close(done)
+	go keepalive(conn, done)
+	const pongWait = 75 * time.Second
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+
 	room := s.getRoom(roomID)
 
 	var paired bool
@@ -220,7 +233,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		left := room.remove(peer)
 		s.log.Printf("room %s: %s left (agents left=%d)", roomID, role, left)
-		s.dropIfEmpty(roomID, room, left)
+		s.dropIfEmpty(roomID, room)
 		_ = conn.Close()
 	}()
 
@@ -262,20 +275,46 @@ func (s *Server) getRoom(id string) *Room {
 	return r
 }
 
-// dropIfEmpty forgets a room once it has no agent connection left. A room with
-// waiting browsers but no agent is kept, so a browser that arrived first is not
-// thrown away while the agent is still dialing.
-func (s *Server) dropIfEmpty(id string, room *Room, agentsLeft int) {
-	if agentsLeft > 0 {
-		return
-	}
+// dropIfEmpty forgets a room once it holds no peers at all.
+//
+// The check is done against the room currently stored under id, not against the
+// snapshot the caller computed: between remove() returning and this call a new
+// peer may have joined, and deleting the room then would strand that peer in an
+// orphaned struct (and strand every idle agent connection with it).
+func (s *Server) dropIfEmpty(id string, room *Room) {
 	room.mu.Lock()
-	hasWaiters := len(room.waiting) > 0
+	empty := len(room.idle) == 0 && len(room.bound) == 0 && len(room.waiting) == 0
 	room.mu.Unlock()
-	if hasWaiters {
+	if !empty {
 		return
 	}
 	s.mu.Lock()
-	delete(s.rooms, id)
+	// Only drop the exact room we inspected; if it was replaced, leave it.
+	if cur, ok := s.rooms[id]; ok && cur == room {
+		delete(s.rooms, id)
+	}
 	s.mu.Unlock()
+}
+
+// keepalive pings a websocket so idle NAT mappings do not expire silently.
+//
+// Without this, a connection through NAT can be dropped by the network with
+// neither side noticing: the peer never reads EOF, so the relay keeps handing
+// it out as a live agent and browsers pair with a corpse. The symptom is a room
+// that reports agents present while every browser waits forever.
+func keepalive(conn *websocket.Conn, done <-chan struct{}) {
+	const interval = 20 * time.Second
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
 }

@@ -157,3 +157,41 @@ func TestBrowserWaitsThenBinds(t *testing.T) {
 	send(t, browser, "late-offer")
 	expect(t, agent, "late-offer", "offer forwarded to late agent")
 }
+// A room must not be forgotten while it still holds agent connections. The old
+// code decided emptiness from a count taken before the lock was re-acquired, so
+// a peer joining in that window ended up in a room the map had already dropped
+// — stranding every idle agent with it. This is what made eight agent slots
+// collapse to one in the field.
+func TestRoomSurvivesWhileAgentsRemain(t *testing.T) {
+	logger := log.New(os.Stderr, "[relay-test] ", log.LstdFlags)
+	srv := httptest.NewServer(signaling.NewServer(logger).Handler())
+	defer srv.Close()
+
+	// Two agents hold slots; a browser joins and leaves.
+	agentA := dial(t, srv.URL, "keep", "agent")
+	defer func() { _ = agentA.Close() }()
+	agentB := dial(t, srv.URL, "keep", "agent")
+	defer func() { _ = agentB.Close() }()
+
+	browser := dial(t, srv.URL, "keep", "browser")
+	_ = browser.Close()
+
+	// Give the relay a moment to process the browser's departure.
+	time.Sleep(300 * time.Millisecond)
+
+	// Both agents must still be usable: a new browser is served without any
+	// agent re-dialing.
+	browser2 := dial(t, srv.URL, "keep", "browser")
+	defer func() { _ = browser2.Close() }()
+
+	send(t, browser2, "after-leave")
+	if who, ok := tryRead(agentA, "agentA", "after-leave"); ok {
+		_ = who
+		return
+	}
+	if who, ok := tryRead(agentB, "agentB", "after-leave"); ok {
+		_ = who
+		return
+	}
+	t.Fatal("neither surviving agent served the new browser; the room was dropped")
+}
