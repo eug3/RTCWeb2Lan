@@ -1,30 +1,30 @@
 # Roadmap
 
-## Phase 1 — SW 拦截骨架（已完成）
+## 已完成
 
-- [x] overlay URL 方案 `/__et__/<ip>[:port]/<path>`
+- [x] Service Worker 拦截与 Response 回灌（scope `/`，URL 全程不变）
 - [x] HTTP/1.1 编解码（Content-Length / chunked / EOF 三种定界）
-- [x] Service Worker fetch 拦截与 Response 回灌
-- [x] mock transport，19 个单测
-- [x] 真实 Chrome 中验证注册与拦截
+- [x] 自建 WebRTC DataChannel 数据面（pion/webrtc + 浏览器原生 RTCPeerConnection）
+- [x] **单通道多路复用**：帧头 `kind + stream id`，替代「一请求一通道」
+- [x] 内网 Agent：路由表 + 反向代理 + 每 target 的 cookie jar
+- [x] 认证走隧道：Agent 自己登录并持有会话，业务接口全程 P2P
+- [x] 兜底反代内置进 `fdn`，取代宿主机 nginx vhost
+- [x] 首次访问引导：无 Service Worker 时由 `fdn` 302 到连接页
+- [x] 优雅降级：连续三次交换失败才判定数据面已死
+- [x] 连接页（明亮紧凑）与 holder 常驻 iframe
+- [x] 双镜像：`fdn`（公网边缘）与 `tunnelagent`（内网）
 
-## Phase 2 — 接真实数据面
+## 待办
 
-- [ ] 以子模块 vendored `easytier-js`，从源码构建 WASM（需 `wasm32-wasip1`，本机已装）
-- [ ] `createEasyTierTransport` 接上 `connectTcp`
-- [ ] 主线程 ↔ SW 的 MessagePort 通道（SW 不能直接持有 WASM 实例时）
-- [ ] 连接复用（keep-alive），去掉每请求一条流
+- [ ] 大文件 / 流式响应（当前整包缓冲，`ReadableStream` 可省内存）
+- [ ] 并发上限与更细的背压（当前对 SW 侧串行）
+- [ ] WebSocket 走隧道（受 Service Worker API 限制，见「已知限制」）
+- [ ] 多站点部署的配置校验工具（当前靠 `fdn` 日志的 `no route:`）
 
-## Phase 3 — 工程化
+## 已否决的方向
 
-- [ ] 大文件 / 流式响应（`ReadableStream` 不缓冲整包）
-- [ ] 并发上限与背压
-- [ ] 门户侧配置 UI（选择目标网段 / 节点）
-- [ ] 公网中继（可用官方 `@easytier/cloudflare`）
-
-## 待决策
-
-- **传输层**：官方走 WebSocket 中继；自建 WebRTC DataChannel 等于 fork EasyTier 传输层，
-  工作量差一个数量级，需单独评估收益。
-- **WASM 实例归属**：SW 是单线程且可能被终止，WASM 实例大概率应放在页面/SharedWorker，
-  SW 只做协议转换与转发。
+| 方向 | 为什么否决 |
+| --- | --- |
+| vendored `easytier-js` + WASM | 浏览器内 WASM overlay 通常禁用 P2P，只能经 WebSocket 中继，达不到「稳态流量不过公网」。改为自建 WebRTC 数据面。 |
+| 一请求一 DataChannel | 每请求一次 DCEP 握手，Chrome/pion 经常完不成；实测命中率 0/25。改为单通道多路复用。 |
+| 认证绕开隧道（`neverTunnel: ["/api/auth"]`） | 会让每个业务请求先经隧道拿 401 再重放源站，P2P 无收益。改为 Agent 自登录。 |
