@@ -170,7 +170,13 @@ async function boot(): Promise<void> {
       return;
     }
   } catch (error) {
-    setStage("SW 注册失败：" + (error instanceof Error ? error.message : String(error)), "bad");
+    // Registration can fail for reasons the visitor cannot fix — most notably an
+    // engine without module service worker support (Safari below 16.4). Never
+    // leave them on a page with no way forward: fall back to the plain origin
+    // path, which needs no Service Worker at all.
+    setStage("SW 注册失败，已改为经反代进入：" + (error instanceof Error ? error.message : String(error)), "bad");
+    setCookie("w2l_direct", 1800);
+    setTimeout(() => location.replace("/"), 1500);
     return;
   }
 
