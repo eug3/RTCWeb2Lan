@@ -152,3 +152,66 @@ func TestSignalingKeepsHijackerCapableWriter(t *testing.T) {
 		t.Fatalf("signaling route did not run (status %d)", rec.Code)
 	}
 }
+
+// A first-time visitor has no Service Worker, so the browser-side gate never
+// runs and they would silently get the fallback path. Steer the site root to
+// the connect page instead, but never override an explicit choice.
+func TestFirstVisitRootRedirectsToConnect(t *testing.T) {
+	target := newTarget(t)
+	routes, err := relay.NewTableForTest([]relay.RouteSpec{
+		{Kind: "host", Host: "app.example.com", Target: target.URL},
+	}, false)
+	if err != nil {
+		t.Fatalf("routes: %v", err)
+	}
+	srv := newFDN(routes)
+
+	rootNav := func(cookies ...string) *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "http://app.example.com/", nil)
+		req.Host = "app.example.com"
+		req.Header.Set("Accept", "text/html,application/xhtml+xml")
+		req.Header.Set("Sec-Fetch-Mode", "navigate")
+		for _, c := range cookies {
+			req.AddCookie(&http.Cookie{Name: c, Value: "1"})
+		}
+		return req
+	}
+
+	// First visit: redirect.
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, rootNav())
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/__lan/connect.html" {
+		t.Errorf("Location = %q, want /__lan/connect.html", loc)
+	}
+
+	// After a connect (grace) or an explicit choice (direct): proxy, no redirect.
+	for _, cookie := range []string{"w2l_grace", "w2l_direct"} {
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, rootNav(cookie))
+		if rec.Code == http.StatusFound {
+			t.Errorf("cookie %s: got redirect, want proxy", cookie)
+		}
+	}
+
+	// Non-root and non-navigation requests are proxied, not redirected.
+	deep := httptest.NewRequest(http.MethodGet, "http://app.example.com/api/x", nil)
+	deep.Host = "app.example.com"
+	deep.Header.Set("Accept", "text/html")
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, deep)
+	if rec.Code == http.StatusFound {
+		t.Errorf("deep path: got redirect, want proxy")
+	}
+
+	asset := httptest.NewRequest(http.MethodGet, "http://app.example.com/", nil)
+	asset.Host = "app.example.com"
+	asset.Header.Set("Accept", "application/json")
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, asset)
+	if rec.Code == http.StatusFound {
+		t.Errorf("non-HTML accept: got redirect, want proxy")
+	}
+}

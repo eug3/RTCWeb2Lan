@@ -119,6 +119,9 @@ function showFailure(): void {
 function finish(): void {
   sceneEl.classList.add("done");
   titleEl.textContent = "链路已焊通";
+  // The attempt counter is a retry hint; on success it is just noise.
+  attemptEl.textContent = "";
+  failBox.style.display = "none";
   // w2l_grace: while the SPA boots and its holder iframe reconnects, "/"
   // must pass through even though the overlay is briefly down.
   setCookie("w2l_grace", 60);

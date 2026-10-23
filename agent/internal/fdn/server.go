@@ -114,11 +114,56 @@ func (s *Server) build() http.Handler {
 	return mux
 }
 
+// Cookie names shared with the browser side (see nav-gate.ts / connect.ts).
+const (
+	// graceCookie is set for a short window after a successful connect, so the
+	// site root keeps loading while the SPA boots and its holder reconnects.
+	graceCookie = "w2l_grace"
+	// directCookie records that the visitor chose to use the fallback path and
+	// does not want to be offered the overlay again for a while.
+	directCookie = "w2l_direct"
+)
+
+// wantsConnectPage reports whether this request should be steered to the
+// connect page instead of being proxied.
+//
+// The Service Worker already does this for a browser that has one (see
+// decideNavigation), but a first-time visitor has no worker yet, so the request
+// never reaches it. Without this, such a visitor silently gets the fallback
+// path and never learns the overlay exists. Only the site root, only a
+// top-level HTML navigation, and only when the visitor has expressed no
+// preference either way.
+func (s *Server) wantsConnectPage(r *http.Request) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	if r.URL.Path != "/" {
+		return false
+	}
+	if !strings.Contains(r.Header.Get("Accept"), "text/html") {
+		return false
+	}
+	if r.Header.Get("Sec-Fetch-Mode") != "" && r.Header.Get("Sec-Fetch-Mode") != "navigate" {
+		return false
+	}
+	for _, c := range r.Cookies() {
+		if c.Name == graceCookie || c.Name == directCookie {
+			return false
+		}
+	}
+	return true
+}
+
 // serveFallback proxies a request to the intranet target chosen by the route
 // table. It is the container-side replacement for the old nginx `location /`.
 func (s *Server) serveFallback(w http.ResponseWriter, r *http.Request) {
 	if s.opts.Routes == nil {
 		http.NotFound(w, r)
+		return
+	}
+
+	if s.wantsConnectPage(r) {
+		http.Redirect(w, r, s.opts.OverlayPrefix+"/connect.html", http.StatusFound)
 		return
 	}
 
