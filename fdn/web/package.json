@@ -2,6 +2,7 @@
   "name": "@web2lan/fdn-web",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@11.28.5",
   "type": "module",
   "description": "Access intranet web apps from any browser with an unchanged URL: Service Worker interception over a peer-to-peer WebRTC DataChannel, no intranet app changes.",
   "scripts": {

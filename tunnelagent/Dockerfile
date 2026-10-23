@@ -17,7 +17,9 @@ WORKDIR /app
 
 COPY --from=go /out/tunnelagent /app/tunnelagent
 # The route table decides which intranet service each public host maps to.
-COPY routes.yaml /app/routes.yaml
+# The bundled file is a TEMPLATE (placeholder host); mount your real one:
+#   -v /path/to/routes.yaml:/app/routes.yaml:ro
+COPY tunnelagent/routes.yaml /app/routes.yaml
 
 ENTRYPOINT ["/app/tunnelagent"]
 CMD ["-signal", "wss://edge.example.com/__lan/ws", "-room", "default", "-routes", "/app/routes.yaml"]

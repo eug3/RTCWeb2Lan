@@ -6,9 +6,14 @@
 
 FROM node:22-alpine AS web
 WORKDIR /web
-RUN corepack enable
-COPY fdn/web/package.json fdn/web/pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
+# Pin pnpm explicitly instead of relying on corepack: corepack resolves the
+# latest release, whose dependency-approval config key differs between major
+# versions and silently breaks the install.
+RUN npm install -g pnpm@11.28.5
+COPY fdn/web/package.json fdn/web/pnpm-lock.yaml fdn/web/pnpm-workspace.yaml ./
+# pnpm refuses to run dependency build scripts unless approved; esbuild needs
+# one for vite's bundler.
+RUN pnpm install --frozen-lockfile --config.dangerouslyAllowAllBuilds=true
 COPY fdn/web/tsconfig.json fdn/web/vite.config.ts fdn/web/index.html fdn/web/connect.html fdn/web/holder.html ./
 COPY fdn/web/src ./src
 COPY fdn/web/public ./public

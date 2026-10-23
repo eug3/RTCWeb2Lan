@@ -1,2 +1,5 @@
-allowBuilds:
-  esbuild: true
+# Dependency build scripts (esbuild's postinstall) must be approved or pnpm
+# fails the install with ERR_PNPM_IGNORED_BUILDS. Note: pnpm no longer reads
+# the "pnpm" field in package.json, so this setting lives here.
+onlyBuiltDependencies:
+  - esbuild
