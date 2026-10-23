@@ -1,6 +1,9 @@
 node_modules
 dist
+dist.tar
+*.tgz
 .dev-bin
 .dev-target
 *.log
+logs
 .git

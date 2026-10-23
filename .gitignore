@@ -1,5 +1,8 @@
 node_modules/
 dist/
+# 构建产物：不要提交 tar 包
+dist.tar
+*.tgz
 *.log
 .DS_Store
 .dev-bin/
