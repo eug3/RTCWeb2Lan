@@ -335,6 +335,167 @@ curl -o /dev/null -w '%{http_code} -> %{redirect_url}\n' \
 
 > 不要用「有没有 `server` 头」判断——上游可能自己发 `server`，源站也会盖一个，这个信号两个方向都不可靠。
 
+### Docker 配置要点
+
+上面两条 `docker run` 是最小可用形态。以下是容器层面容易踩的地方。
+
+#### 配置从哪来
+
+两个容器都是**配置挂载进容器**，而不是打进镜像：
+
+| 配置 | 容器内路径 | 谁读 | 怎么给 |
+| --- | --- | --- | --- |
+| `routes.yaml` | `/app/routes.yaml` | fdn（兜底）+ tunnelagent（隧道） | `-v` 挂载同一个文件 |
+| `config.json` | `/app/dist/config.json` | 浏览器（SW） | **已打进镜像**，改它需要重建镜像 |
+
+`routes.yaml` 是运行时挂载的，**改完 `docker restart` 即生效**，不必重建。
+`config.json` 随前端资产构建，**必须重建镜像**（或用 `docker cp` 临时覆盖，不推荐）。
+
+> 镜像里内置的 `routes.yaml` 只是占位模板（`app.example.com`）。不挂载真实路由表，兜底会 502。
+
+#### 端口与网络
+
+| 容器 | 网络 | 端口 | 说明 |
+| --- | --- | --- | --- |
+| `fdn` | bridge（默认） | `-p 127.0.0.1:8080:8080` | **绑 127.0.0.1**，只让本机 TLS 层访问 |
+| `tunnelagent` | **`--network host`** | 不监听 | 必须 host，否则看不到宿主的内网路由 |
+
+`tunnelagent` 用 host 网络的两个理由：
+
+1. 它要访问内网服务（VPN、EasyTier/WireGuard 等虚拟网卡只存在于宿主机命名空间）
+2. 它要广播正确的 ICE host candidate；bridge 下只有 `172.17.x.x`，对端根本连不上
+
+如果确实不能用 host 网络，退路是给容器加内网路由，或用 `-advertise-cidr` 限定广播范围——但通常不值得，host 网络最省事。
+
+#### 用 compose 编排
+
+```yaml
+# 公网侧 docker-compose.yml
+services:
+  fdn:
+    image: rtcweb2lan/fdn
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./routes.yaml:/app/routes.yaml:ro
+    command:
+      - -addr
+      - ":8080"
+      - -static
+      - /app/dist
+      - -routes
+      - /app/routes.yaml
+```
+
+```yaml
+# 内网侧 docker-compose.yml
+services:
+  tunnelagent:
+    image: rtcweb2lan/tunnelagent
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./routes.yaml:/app/routes.yaml:ro
+    command:
+      - -signal
+      - wss://edge.example.com/__lan/ws
+      - -room
+      - default
+      - -routes
+      - /app/routes.yaml
+      - -advertise-cidr
+      - 10.0.0.0/8
+      - -stun
+      - stun:stun.example.com:3478
+```
+
+#### 健康检查
+
+`fdn` 有可探测的端点，可以直接用于编排的 healthcheck：
+
+```yaml
+healthcheck:
+  test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/__lan/config.json"]
+  interval: 30s
+  timeout: 5s
+  retries: 3
+```
+
+`tunnelagent` **没有 HTTP 端口**，无法用 curl 探活。只能看日志或从 fdn 侧观察：
+
+```bash
+docker logs --since 1m tunnelagent | grep -E 'joined room|relay says ready'
+```
+
+#### 升级顺序
+
+两端共用同一套帧协议，**必须同时升级**，否则隧道不工作（表现为所有请求回落兜底，功能仍可用）。
+
+```bash
+# 1. 先升内网侧（此时旧 fdn 与新 agent 协议不一致，隧道暂时不可用）
+docker compose -f intranet/docker-compose.yml pull && docker compose -f intranet/docker-compose.yml up -d
+
+# 2. 立刻升公网侧，隧道恢复
+docker compose -f public/docker-compose.yml pull && docker compose -f public/docker-compose.yml up -d
+```
+
+重启 `fdn` 会中断信令，`tunnelagent` 会在几秒内自动重连。若没重连，重启它一次：
+
+```bash
+docker restart tunnelagent
+```
+
+#### 多架构
+
+镜像默认按构建机架构产出。构建机与部署机不同（例如 Apple Silicon 构建、x86_64 部署）时必须交叉构建：
+
+```bash
+docker buildx build --platform linux/amd64 -f fdn/Dockerfile -t rtcweb2lan/fdn --load .
+docker save rtcweb2lan/fdn -o fdn.tar
+scp fdn.tar root@edge:/tmp/ && ssh root@edge 'docker load -i /tmp/fdn.tar'
+```
+
+验证架构：
+
+```bash
+docker image inspect rtcweb2lan/fdn --format '{{.Os}}/{{.Architecture}}'
+```
+
+#### 配置示例（routes.yaml）
+
+```yaml
+routes:
+  - name: app
+    kind: host
+    host: app.example.com
+    target: https://192.168.1.10:8443
+    insecure_tls: true          # 内网自签证书
+    # upstream_sni: app.internal  # vhost 靠 SNI 分流时指定
+
+  - name: other
+    kind: prefix
+    host: app.example.com
+    prefix: /other
+    target: http://192.168.1.11:8080
+```
+
+#### 容器内没有 shell
+
+运行镜像是 `alpine` 但**只装了 `ca-certificates` 和 `tzdata`**，没有 `sh`、`curl`、`tar`、`python3`。
+
+这意味着：
+
+- 不能用 `docker exec ... sh -c` 做运维
+- 备份/替换文件走宿主机：`docker cp` 或挂载卷
+- 健康检查用 `wget`（busybox 自带）而不是 `curl`
+
+需要调试时，用临时容器挂同一个卷：
+
+```bash
+docker run --rm -it -v /etc/rtcweb2lan:/cfg alpine sh
+```
+
 ### 首次访问的行为
 
 | 状态 | 访问 `/` 时 |
@@ -343,19 +504,6 @@ curl -o /dev/null -w '%{http_code} -> %{redirect_url}\n' \
 | 刚连接过（`w2l_grace`，60 秒内） | 直接进站 |
 | 用户点过「直接进入」（`w2l_direct`，30 分钟） | 直接进站 |
 | API / 非 HTML / 深层路径 | 直接反代，不受影响 |
-
-### 升级
-
-```bash
-docker rm -f fdn && docker run -d ... rtcweb2lan/fdn   # 用新镜像重跑
-```
-
-前端资产打进了镜像，**升级必须换镜像**，不能只替换文件。
-
-> 换镜像会重启信令，`tunnelagent` 需要重连。若它没有自动恢复，重启一次即可：
-> ```bash
-> docker restart tunnelagent
-> ```
 
 ### 排障
 
