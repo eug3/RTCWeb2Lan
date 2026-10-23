@@ -20,7 +20,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"os"
-	"path"
 	"strings"
 
 	"github.com/beijihu/easytier-web2lan/agent/internal/relay"
@@ -154,6 +153,26 @@ func (s *Server) wantsConnectPage(r *http.Request) bool {
 	return true
 }
 
+// joinURLPath joins a target's base path with a request path, preserving a
+// trailing slash.
+//
+// path.Join is the obvious choice but it cleans the result, so "/socket.io/"
+// becomes "/socket.io". Socket.IO serves only the former and 404s the latter,
+// which silently broke the app's realtime channel through the fallback.
+func joinURLPath(base, reqPath string) string {
+	if base == "" || base == "/" {
+		return reqPath
+	}
+	if reqPath == "" {
+		return base
+	}
+	joined := strings.TrimSuffix(base, "/") + "/" + strings.TrimPrefix(reqPath, "/")
+	if strings.HasSuffix(reqPath, "/") && !strings.HasSuffix(joined, "/") {
+		joined += "/"
+	}
+	return joined
+}
+
 // serveFallback proxies a request to the intranet target chosen by the route
 // table. It is the container-side replacement for the old nginx `location /`.
 func (s *Server) serveFallback(w http.ResponseWriter, r *http.Request) {
@@ -182,7 +201,10 @@ func (s *Server) serveFallback(w http.ResponseWriter, r *http.Request) {
 		Director: func(req *http.Request) {
 			req.URL.Scheme = target.URL.Scheme
 			req.URL.Host = target.URL.Host
-			req.URL.Path = path.Join(target.URL.Path, outPath)
+			req.URL.Path = joinURLPath(target.URL.Path, outPath)
+			// The query string must survive verbatim: Socket.IO's handshake
+			// encodes its transport there (/socket.io/?EIO=4&transport=...).
+			req.URL.RawQuery = r.URL.RawQuery
 			req.Host = req.Header.Get("X-Forwarded-Host")
 			if req.Host == "" {
 				req.Host = host

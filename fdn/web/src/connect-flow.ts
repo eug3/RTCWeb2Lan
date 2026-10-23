@@ -8,9 +8,19 @@
  * traffic. Any failure must leave the SW disabled (nginx fallback).
  */
 
-import { attachDataPlane, instanceFromPeer } from "./data-plane.js";
+import { attachDataPlane, instanceFromPeer, runExchange } from "./data-plane.js";
+import { encodeRequest, parseResponse } from "./http1.js";
 import { connectAsInitiator, type PeerConnectionHandle, type SignalChannel } from "./peer.js";
 import type { SignalMessage } from "./signaling.js";
+
+/** One HTTP exchange straight over the peer connection, bypassing the SW. */
+function exchangeOverPeer(
+  peer: PeerConnectionHandle,
+  wire: Uint8Array,
+  timeoutMs: number,
+): Promise<Uint8Array> {
+  return runExchange(instanceFromPeer(peer), wire, timeoutMs);
+}
 
 export function makeSignalChannel(ws: WebSocket): SignalChannel {
   const handlers: Array<(m: SignalMessage) => void> = [];
@@ -166,17 +176,67 @@ export async function ensureOurWorker(
  * Must carry its own timeout: a connected-but-dead peer (wedged agent) never
  * answers, and without a deadline the whole connect flow would hang forever.
  */
+/**
+ * Verify the tunnel by running one real HTTP exchange over the peer connection.
+ *
+ * This asks the only question that matters — can this link carry an HTTP
+ * request and return a response? — without depending on Service Worker state,
+ * on the overlay having been enabled, or on how the SW chooses to render the
+ * upstream's status code.
+ *
+ * Returns true for ANY well-formed HTTP response, including 401/403/500: those
+ * prove the round trip completed. Only a transport failure (no reply, malformed
+ * reply, timeout) means the tunnel is unusable.
+ */
+export async function probePeer(
+  peer: PeerConnectionHandle,
+  path = "/api/",
+  timeoutMs = 15000,
+): Promise<boolean> {
+  const authority = new URL(path, location.origin).host;
+  const requestPath = path.startsWith("/") ? path : "/" + path;
+  const wire = encodeRequest(
+    {
+      method: "GET",
+      path: requestPath,
+      headers: [
+        ["host", authority],
+        ["accept", "*/*"],
+        ["connection", "close"],
+      ],
+    },
+    authority,
+  );
+
+  try {
+    const reply = await exchangeOverPeer(peer, wire, timeoutMs);
+    // A response we can parse at all means the round trip worked.
+    parseResponse(reply);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function probeTunnel(path = "/", timeoutMs = 8000): Promise<boolean> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(path, { cache: "no-store", redirect: "manual", signal: controller.signal });
     if (res.status <= 0) return false;
-    // Evidence that the SW intercepted: either a tunnel reply (no `server`
-    // header) or one of our fallback markers — the 401 fallback replays via
-    // nginx (which stamps `server`), so the marker alone also proves the
-    // overlay path executed.
-    return res.headers.get("x-w2l") !== null || res.headers.get("server") === null;
+    // Which path served the request is decided by the SW's marker.
+    //
+    //   x-w2l: tunnel       — the tunnel carried it end to end
+    //   x-w2l: 401-fallback — the tunnel carried it, the upstream answered 401,
+    //                         and the SW replayed it via the origin so the
+    //                         browser's httpOnly cookie is used
+    //
+    // The second case still proves the tunnel works: the 401 could only come
+    // from the agent side. Treating it as failure made every probe against a
+    // login-protected API report "tunnel down", which then tore the tunnel
+    // down for real.
+    const marker = res.headers.get("x-w2l");
+    return marker === "tunnel" || marker === "401-fallback";
   } catch {
     return false;
   } finally {
@@ -258,16 +318,26 @@ export async function connectFlow(options: ConnectFlowOptions): Promise<ConnectF
 
   onStage({ stage: "attaching" });
   try {
-    await attachPortToServiceWorker(peer);
-    await setOverlayEnabled(true);
-
+    // Verify the tunnel BEFORE handing it to the Service Worker.
+    //
+    // Probing through the SW was unreliable: the probe depended on the SW
+    // having accepted `overlay:enable`, which in turn depends on its data-plane
+    // port being ready, and the probe path itself may answer 401 (in which case
+    // the SW replays it via the origin and the reply looks like a fallback).
+    // That chain of conditions made a perfectly healthy peer report "tunnel
+    // down" and tear itself apart.
+    //
+    // Talking to the peer directly is the real question: can this connection
+    // carry an HTTP exchange? Everything else is bookkeeping.
     onStage({ stage: "verifying" });
-    const ok = await probeTunnel(options.probePath);
-    if (!ok) {
+    const reachable = await probePeer(peer, options.probePath, options.timeoutMs);
+    if (!reachable) {
       peer.close();
-      await setOverlayEnabled(false).catch(() => {});
       throw new Error("隧道探测失败");
     }
+
+    await attachPortToServiceWorker(peer);
+    await setOverlayEnabled(true);
   } catch (error) {
     await setOverlayEnabled(false).catch(() => {});
     const reason = error instanceof Error ? error.message : String(error);

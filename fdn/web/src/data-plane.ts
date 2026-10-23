@@ -80,7 +80,7 @@ export function attachDataPlane(
 const FIRST_CHUNK_BUDGET_MS = 2_000;
 const MAX_ATTEMPTS = 5;
 
-async function runExchange(
+export async function runExchange(
   instance: OverlayInstanceLike,
   requestBytes: Uint8Array,
   timeoutMs: number,

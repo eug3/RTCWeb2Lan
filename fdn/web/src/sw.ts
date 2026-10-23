@@ -403,7 +403,7 @@ async function tunnel(
     if (viaOrigin) return viaOrigin;
   }
 
-  return toResponse(request, parsed);
+  return toResponse(request, parsed, "tunnel");
 }
 
 /**
@@ -416,6 +416,7 @@ async function replayViaOrigin(request: Request, marker: string): Promise<Respon
     const origin = await fetch(request);
     const headers = new Headers(origin.headers);
     headers.set("x-w2l", marker);
+    headers.delete("server");
     return new Response(origin.body, {
       status: origin.status,
       statusText: origin.statusText,
@@ -446,7 +447,7 @@ async function relaySetCookies(cookies: string[]): Promise<void> {
   }
 }
 
-function toResponse(request: Request, parsed: ReturnType<typeof parseResponse>): Response {
+function toResponse(request: Request, parsed: ReturnType<typeof parseResponse>, marker?: string): Response {
   const headers = new Headers();
   const setCookies = extractSetCookies(parsed.headers);
   for (const [name, value] of parsed.headers) {
@@ -457,6 +458,11 @@ function toResponse(request: Request, parsed: ReturnType<typeof parseResponse>):
       // ignore header names the Fetch layer refuses
     }
   }
+  // Tag replies that came over the tunnel so callers can tell the two paths
+  // apart from the response alone. The `server` header cannot be used for
+  // this: an upstream may send one, and the origin stamps its own, so its
+  // presence says nothing about which path served the request.
+  if (marker) headers.set("x-w2l", marker);
   const nullBody = request.method === "HEAD" || parsed.status === 204 || parsed.status === 304;
   void relaySetCookies(setCookies);
   return new Response(nullBody ? null : (parsed.body as unknown as BodyInit), {
