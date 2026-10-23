@@ -6,6 +6,8 @@ import {
   mergeSiteConfig,
   normalizeSiteConfig,
   parseAuthority,
+  pathMatchesPrefix,
+  shouldTunnel,
   targetToAuthority,
   type SiteConfig,
 } from "../src/config.js";
@@ -147,5 +149,53 @@ describe("probePath is tunnel-intercepted", () => {
 
   it("a root probe would NOT be covered (documents the trap)", () => {
     expect(covered("/", DEFAULT_SITE_PROFILE.apiPrefixes)).toBe(false);
+  });
+});
+
+describe("neverTunnel keeps auth on the origin", () => {
+  // The session cookie is HttpOnly: a Service Worker cannot read it, so a
+  // tunnelled /api/auth/* would look logged-out. These must go to nginx,
+  // where the browser attaches cookies natively.
+  const site = { ...DEFAULT_SITE_PROFILE, neverTunnel: ["/api/auth"], apiPrefixes: ["/api/"] };
+
+  it("does not tunnel login, logout or session", () => {
+    for (const p of ["/api/auth/login", "/api/auth/logout", "/api/auth/session"]) {
+      expect(shouldTunnel(p, site), p).toBe(false);
+    }
+  });
+
+  it("still tunnels ordinary API calls", () => {
+    for (const p of ["/api/projects", "/api/tasks", "/api/vfs/list"]) {
+      expect(shouldTunnel(p, site), p).toBe(true);
+    }
+  });
+
+  it("matches on segment boundaries, not raw prefixes", () => {
+    // A sibling path that merely starts with the same letters must NOT match.
+    expect(shouldTunnel("/api/authenticate", site)).toBe(true);
+    expect(shouldTunnel("/api/author", site)).toBe(true);
+    // The bare prefix itself is covered.
+    expect(shouldTunnel("/api/auth", site)).toBe(false);
+  });
+
+  it("leaves paths outside apiPrefixes unntercepted either way", () => {
+    expect(shouldTunnel("/static/app.js", site)).toBe(false);
+    expect(shouldTunnel("/", site)).toBe(false);
+  });
+});
+
+describe("pathMatchesPrefix", () => {
+  it("matches the prefix itself and its children", () => {
+    expect(pathMatchesPrefix("/api/auth", "/api/auth")).toBe(true);
+    expect(pathMatchesPrefix("/api/auth/login", "/api/auth")).toBe(true);
+  });
+
+  it("rejects look-alike siblings", () => {
+    expect(pathMatchesPrefix("/api/authenticate", "/api/auth")).toBe(false);
+  });
+
+  it("tolerates a trailing slash and a root prefix", () => {
+    expect(pathMatchesPrefix("/api/auth/login", "/api/auth/")).toBe(true);
+    expect(pathMatchesPrefix("/anything", "/")).toBe(true);
   });
 });

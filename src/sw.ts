@@ -12,6 +12,7 @@ import {
   DEFAULT_SITE_CONFIG,
   mergeSiteConfig,
   normalizeSiteConfig,
+  shouldTunnel as configShouldTunnel,
   type RouteRule,
   type SiteConfig,
 } from "./config.js";
@@ -225,9 +226,7 @@ self.addEventListener("message", (event: ExtendableMessageEvent) => {
  * which the SW cannot read off a Request).
  */
 function shouldTunnel(pathname: string): boolean {
-  const { neverTunnel, apiPrefixes } = config.site;
-  if (neverTunnel.some((p) => pathname === p || pathname.startsWith(p + "/"))) return false;
-  return apiPrefixes.some((p) => pathname.startsWith(p));
+  return configShouldTunnel(pathname, config.site);
 }
 
 self.addEventListener("fetch", (event: FetchEvent) => {

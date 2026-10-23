@@ -188,3 +188,26 @@ export function normalizeSiteConfig(raw: unknown): SiteConfig {
 
   return { routes, site, signaling };
 }
+
+/**
+ * Does a path prefix list cover this pathname? Matching is on segment
+ * boundaries, so "/api/auth" covers "/api/auth/login" and "/api/auth" itself,
+ * but NOT "/api/authenticate".
+ */
+export function pathMatchesPrefix(pathname: string, prefix: string): boolean {
+  const p = prefix.endsWith("/") && prefix.length > 1 ? prefix.slice(0, -1) : prefix;
+  if (p === "/") return pathname.startsWith("/");
+  return pathname === p || pathname.startsWith(p + "/");
+}
+
+/**
+ * Should the Service Worker intercept this request into the tunnel?
+ *
+ * neverTunnel always wins: those paths must reach the origin over nginx so
+ * the browser attaches its own (HttpOnly) cookies. Everything else is tunnelled
+ * only when it falls under a configured apiPrefix.
+ */
+export function shouldTunnel(pathname: string, site: SiteProfile): boolean {
+  if (site.neverTunnel.some((p) => pathMatchesPrefix(pathname, p))) return false;
+  return site.apiPrefixes.some((p) => pathname.startsWith(p));
+}
