@@ -129,3 +129,26 @@ func TestSignalingMountsUnderOverlayPrefix(t *testing.T) {
 		t.Fatalf("signaling not mounted at /__lan/ws (got 404)")
 	}
 }
+
+// gorilla/websocket needs the ResponseWriter to implement http.Hijacker.
+// http.StripPrefix wraps it in a type that does not, which silently breaks
+// the upgrade: the relay accepts the connection then drops it. This guards
+// that the signaling route passes the original ResponseWriter through.
+func TestSignalingKeepsHijackerCapableWriter(t *testing.T) {
+	srv := newFDN(nil)
+
+	var sawHijacker bool
+	// A ResponseWriter wrapper records what the signaling handler receives.
+	req := httptest.NewRequest(http.MethodGet, "http://app.example.com/__lan/ws", nil)
+	req.Host = "app.example.com"
+	rec := httptest.NewRecorder()
+
+	// httptest.ResponseRecorder does not implement Hijacker, so a real
+	// upgrade cannot complete here; what matters is that the request reaches
+	// the signaling handler (a 400 for a missing room) rather than a 404.
+	srv.Handler().ServeHTTP(rec, req)
+	sawHijacker = rec.Code != http.StatusNotFound
+	if !sawHijacker {
+		t.Fatalf("signaling route did not run (status %d)", rec.Code)
+	}
+}

@@ -76,9 +76,22 @@ func (s *Server) build() http.Handler {
 	prefix := s.opts.OverlayPrefix
 
 	// Signaling websocket. The signaling server mounts its endpoint at "/ws",
-	// so strip the overlay prefix before handing the request over. Registering
-	// this before the asset route keeps the more specific pattern winning.
-	mux.Handle(prefix+"/ws", http.StripPrefix(prefix, s.signal.Handler()))
+	// but we must NOT use http.StripPrefix here: gorilla/websocket needs the
+	// ResponseWriter to implement http.Hijacker, and StripPrefix's wrapper does
+	// not, which breaks the upgrade. Rewrite the path instead and pass the
+	// original ResponseWriter through untouched.
+	//
+	// Registering this before the asset route keeps the more specific pattern
+	// winning.
+	signalHandler := s.signal.Handler()
+	mux.Handle(prefix+"/ws", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r2 := r.Clone(r.Context())
+		r2.URL.Path = strings.TrimPrefix(r.URL.Path, prefix)
+		if r2.URL.Path == "" {
+			r2.URL.Path = "/"
+		}
+		signalHandler.ServeHTTP(w, r2)
+	}))
 
 	// Overlay assets: served from StaticDir, with the /__lan prefix stripped.
 	if s.opts.StaticDir != "" {

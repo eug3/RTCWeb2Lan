@@ -25,6 +25,7 @@ import {
   REWRITTEN_HTML_DROP_HEADERS,
 } from "./nav-gate.js";
 import { extractSetCookies } from "./cookie-relay.js";
+import { ExchangeHealth } from "./exchange-health.js";
 
 declare const self: ServiceWorkerGlobalScope;
 
@@ -87,14 +88,33 @@ function attachDataPlanePort(port: MessagePort): void {
 }
 
 /**
- * A failed exchange almost always means the data plane is dead (the page that
- * owned the peer connection went away and the port close event never fired).
- * Failing every request for 120s each would wedge the SPA on boot; instead
- * drop the overlay immediately so requests fall back to nginx while the holder
- * reconnects.
+ * Tracks consecutive exchange failures.
+ *
+ * A single failure is not evidence of a dead data plane: ICE can flap for a
+ * moment, and one SCTP stream can fail while the peer connection itself is
+ * fine. Tearing the tunnel down on the first failure meant one hiccup pushed
+ * every in-flight and subsequent request onto the origin until the holder
+ * finished reconnecting — visible as a multi-second stall and a sudden switch
+ * away from P2P. See exchange-health.ts for the policy.
  */
+const exchangeHealth = new ExchangeHealth();
+
+/** A completed exchange proves the data plane is alive. */
+function noteExchangeOk(): void {
+  exchangeHealth.ok();
+}
+
+/**
+ * Record a failed exchange; only a run of consecutive failures tears the
+ * overlay down.
+ */
+function noteExchangeFailure(): void {
+  if (exchangeHealth.fail()) dropDeadTransport();
+}
+
 function dropDeadTransport(): void {
   overlayEnabled = false;
+  exchangeHealth.reset();
   portTransport?.dispose();
   portTransport = null;
   void notifyOverlayDown();
@@ -326,7 +346,9 @@ async function tunnel(
       "overlay exchange with " + route.authority,
     );
   } catch (error) {
-    dropDeadTransport();
+    // Do NOT drop the overlay on the first failure: a single exchange can fail
+    // on a transient ICE/SCTP blip while the plane is otherwise healthy.
+    noteExchangeFailure();
     // GET/HEAD have no side effects, so serving them from the origin beats a
     // 504 during the reconnect window. POSTs may already have been executed
     // upstream (request delivered, reply lost) and are not replayed.
@@ -337,6 +359,9 @@ async function tunnel(
     const message = error instanceof Error ? error.message : String(error);
     return textResponse(504, "overlay error: " + message);
   }
+
+  // Reaching here means the exchange completed: the plane is alive.
+  noteExchangeOk();
 
   let parsed;
   try {
