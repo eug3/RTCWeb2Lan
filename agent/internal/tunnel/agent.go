@@ -40,16 +40,22 @@ type Agent struct {
 
 // New creates an agent. onCandidate is called for locally gathered candidates.
 //
-// When advertiseCIDR is set, host candidates outside it are not advertised:
+// When advertiseCIDRs is non-empty, host candidates outside every listed
+// network are not advertised:
 // pairs through a routable-but-asymmetric path can pass ICE checks yet never
 // carry SCTP data, which shows up as connections that open channels but never
-// deliver a response. Restricting advertisement pins peers onto the overlay
-// network. Server-reflexive and relay candidates are always advertised so
+// deliver a response. Restricting advertisement pins peers onto the networks
+// you name. Server-reflexive and relay candidates are always advertised so
 // external browsers keep a path in.
+//
+// Several networks are allowed on purpose: advertising both the overlay address
+// (preferred, stable) and the LAN address (an extra NAT-punching chance for a
+// browser outside the overlay) covers both kinds of client, while unrelated
+// interfaces (docker bridges, VPN adapters) stay hidden.
 func New(
 	cfg webrtc.Configuration,
 	routes *relay.RouteTable,
-	advertiseCIDR *net.IPNet,
+	advertiseCIDRs []*net.IPNet,
 	onCandidate func(webrtc.ICECandidateInit),
 	logger *log.Logger,
 ) (*Agent, error) {
@@ -64,12 +70,9 @@ func New(
 		if c == nil {
 			return
 		}
-		if advertiseCIDR != nil && c.Typ == webrtc.ICECandidateTypeHost {
-			ip := net.ParseIP(c.Address)
-			if ip == nil || !advertiseCIDR.Contains(ip) {
-				logger.Printf("skip host candidate %s (outside advertise CIDR)", c.Address)
-				return
-			}
+		if c.Typ == webrtc.ICECandidateTypeHost && !hostCandidateAllowed(c.Address, advertiseCIDRs) {
+			logger.Printf("skip host candidate %s (outside advertise CIDRs)", c.Address)
+			return
 		}
 		if c.Typ == webrtc.ICECandidateTypeRelay {
 			a.mu.Lock()
@@ -103,6 +106,28 @@ func New(
 	})
 
 	return a, nil
+}
+
+// hostCandidateAllowed reports whether a host candidate address should be
+// advertised, given the configured networks.
+//
+// An empty list means "no restriction": advertise whatever the host gathers.
+// Otherwise the address must fall inside one of the listed networks, which is
+// how unrelated interfaces (docker bridges, VPN adapters) are kept out.
+func hostCandidateAllowed(addr string, nets []*net.IPNet) bool {
+	if len(nets) == 0 {
+		return true
+	}
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return false
+	}
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func dcID(dc *webrtc.DataChannel) uint16 {

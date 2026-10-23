@@ -46,7 +46,7 @@ func main() {
 		turnUser   = flag.String("turn-user", "", "TURN username")
 		turnPass   = flag.String("turn-pass", "", "TURN credential")
 		insecure   = flag.Bool("insecure-upstream", false, "skip TLS verification against upstreams")
-		advCIDR    = flag.String("advertise-cidr", "", "only advertise host candidates inside this CIDR, e.g. 10.1.1.0/24 (srflx/relay always kept)")
+		advCIDR    = flag.String("advertise-cidr", "", "comma-separated CIDRs; only host candidates inside them are advertised, e.g. 10.1.1.0/24,192.168.1.0/24 (srflx/relay always kept)")
 	)
 	flag.Parse()
 
@@ -76,21 +76,27 @@ func main() {
 	}
 	webrtcConfig := webrtc.Configuration{ICEServers: iceServers}
 
-	var advertiseNet *net.IPNet
+	// A comma-separated list is allowed so an agent can advertise both its
+	// overlay address (the stable, preferred path) and its LAN address (an
+	// extra chance for a browser that is not on the overlay to punch through
+	// NAT). Unrelated interfaces stay filtered out.
+	var advertiseNets []*net.IPNet
 	if *advCIDR != "" {
-		_, n, err := net.ParseCIDR(*advCIDR)
-		if err != nil {
-			logger.Fatalf("invalid -advertise-cidr: %v", err)
+		for _, part := range splitList(*advCIDR) {
+			_, n, err := net.ParseCIDR(part)
+			if err != nil {
+				logger.Fatalf("invalid -advertise-cidr entry %q: %v", part, err)
+			}
+			advertiseNets = append(advertiseNets, n)
 		}
-		advertiseNet = n
-		logger.Printf("advertising host candidates only inside %s", *advCIDR)
+		logger.Printf("advertising host candidates only inside %v", advertiseNets)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	for {
-		if err := run(ctx, logger, *signalURL, *room, *secret, routes, webrtcConfig, advertiseNet); err != nil {
+		if err := run(ctx, logger, *signalURL, *room, *secret, routes, webrtcConfig, advertiseNets); err != nil {
 			if errors.Is(err, context.Canceled) {
 				return
 			}
@@ -132,7 +138,7 @@ func run(
 	signalURL, room, secret string,
 	routes *relay.RouteTable,
 	webrtcConfig webrtc.Configuration,
-	advertiseNet *net.IPNet,
+	advertiseNets []*net.IPNet,
 ) error {
 	client, err := signaling.Dial(ctx, signalURL, room, secret, logger)
 	if err != nil {
@@ -184,7 +190,7 @@ func run(
 				if agent != nil {
 					_ = agent.Close()
 				}
-				a, err := tunnel.New(webrtcConfig, routes, advertiseNet, func(c webrtc.ICECandidateInit) {
+				a, err := tunnel.New(webrtcConfig, routes, advertiseNets, func(c webrtc.ICECandidateInit) {
 					out := protocol.New(protocol.TypeCandidate, m.Session)
 					out.Candidate = c.Candidate
 					if c.SDPMid != nil {
