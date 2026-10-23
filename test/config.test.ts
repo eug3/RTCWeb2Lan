@@ -39,7 +39,8 @@ describe("defaults carry no intranet addresses", () => {
   it("ships a generic site profile", () => {
     expect(DEFAULT_SITE_PROFILE.apiPrefixes).toEqual(["/api/"]);
     expect(DEFAULT_SITE_PROFILE.neverTunnel).toEqual(["/api/auth/session"]);
-    expect(DEFAULT_SITE_PROFILE.probePath).toBe("/");
+    // Must sit under apiPrefixes so the SW actually intercepts it.
+    expect(DEFAULT_SITE_PROFILE.probePath).toBe("/api/");
   });
 });
 
@@ -127,5 +128,24 @@ describe("target helpers", () => {
   it("rejects invalid ports", () => {
     expect(() => parseAuthority("10.1.1.1:0")).toThrow();
     expect(() => parseAuthority("10.1.1.1:70000")).toThrow();
+  });
+});
+
+/**
+ * Regression guard: the probe path must be intercepted by the SW. If it
+ * falls outside apiPrefixes the request always reaches nginx, probeTunnel
+ * sees a `server` header, and EVERY connect attempt reports "tunnel down"
+ * even though the tunnel is healthy. (This exact bug shipped once.)
+ */
+describe("probePath is tunnel-intercepted", () => {
+  const covered = (probePath: string, prefixes: string[]) =>
+    prefixes.some((p) => probePath === p || probePath.startsWith(p.endsWith("/") ? p : p + "/"));
+
+  it("default probePath falls under the default apiPrefixes", () => {
+    expect(covered(DEFAULT_SITE_PROFILE.probePath, DEFAULT_SITE_PROFILE.apiPrefixes)).toBe(true);
+  });
+
+  it("a root probe would NOT be covered (documents the trap)", () => {
+    expect(covered("/", DEFAULT_SITE_PROFILE.apiPrefixes)).toBe(false);
   });
 });

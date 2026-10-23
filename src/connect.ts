@@ -10,7 +10,7 @@
 
 import { connectFlow, ensureOurWorker, rememberEndpoint, type ConnectStage } from "./connect-flow.js";
 import { loadSiteConfig, pushConfigToServiceWorker } from "./config-loader.js";
-import { DEFAULT_SIGNALING_PROFILE, type SignalingProfile } from "./config.js";
+import { DEFAULT_SITE_CONFIG, DEFAULT_SIGNALING_PROFILE, type SignalingProfile } from "./config.js";
 
 const ASSET_BASE = (() => {
   const path = window.location.pathname;
@@ -57,6 +57,13 @@ function readEndpoint(signaling: SignalingProfile): Endpoint {
 // Initialised from defaults; recomputed from config at the start of boot().
 let endpoint = readEndpoint(DEFAULT_SIGNALING_PROFILE);
 
+/**
+ * Path used to verify a freshly built tunnel. It MUST fall under the configured
+ * apiPrefixes, otherwise the Service Worker never intercepts it, the probe
+ * always reaches nginx, and every connect attempt reports "tunnel down".
+ */
+let probePath = DEFAULT_SITE_CONFIG.site.probePath;
+
 function setStage(text: string, cls: "" | "ok" | "bad" = ""): void {
   stageEl.textContent = text;
   stageEl.style.color = cls === "ok" ? "#46d78a" : cls === "bad" ? "#ff9f8a" : "#ffd166";
@@ -87,6 +94,7 @@ async function tryConnect(): Promise<boolean> {
     try {
       await connectFlow({
         ...endpoint,
+        probePath,
         timeoutMs: CONNECT_TIMEOUT_MS,
         onStage: (s) => onStage(s, attempt),
       });
@@ -123,7 +131,10 @@ async function boot(): Promise<void> {
   // registered on a first visit, and push awaits navigator.serviceWorker.ready,
   // which would deadlock before registration below).
   const config = await loadSiteConfig(ASSET_BASE).catch(() => undefined);
-  if (config) endpoint = readEndpoint(config.signaling);
+  if (config) {
+    endpoint = readEndpoint(config.signaling);
+    probePath = config.site.probePath;
+  }
 
   el<HTMLAnchorElement>("diag-link").href =
     ASSET_BASE + "/?signal=" + encodeURIComponent(endpoint.signalUrl) + "&room=" + encodeURIComponent(endpoint.room);

@@ -6,7 +6,9 @@
     "  kind='prefix' -> a path prefix on a host goes to one target",
     "site.apiPrefixes  -> path prefixes the Service Worker tunnels (rest stays on nginx)",
     "site.neverTunnel  -> paths that must always hit the origin (auth needing httpOnly cookies)",
-    "site.probePath    -> path used to verify the tunnel; any HTTP status counts as alive",
+    "site.probePath    -> path used to verify the tunnel; any HTTP status counts as alive.",
+    "                     MUST fall under one of site.apiPrefixes, otherwise the SW never",
+    "                     intercepts it and the probe always reports 'tunnel down'.",
     "signaling.room    -> signaling room to join",
     "signaling.stun    -> comma-separated STUN URLs ('' disables STUN)"
   ],
@@ -20,7 +22,7 @@
   "site": {
     "apiPrefixes": ["/api/"],
     "neverTunnel": ["/api/auth/session"],
-    "probePath": "/health"
+    "probePath": "/api/projects"
   },
   "signaling": {
     "room": "lan",

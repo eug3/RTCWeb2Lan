@@ -54,12 +54,14 @@ export interface SiteProfile {
   neverTunnel: string[];
   /**
    * Path used to verify a tunnel actually carries traffic after connect.
-   * Any HTTP status proves the round-trip (see probeTunnel); a 4xx is fine and
-   * arguably better than a business endpoint that may be slow (a slow endpoint
-   * would make a healthy tunnel look dead).
+   * Any HTTP status proves the round-trip (see probeTunnel), so a 401/404 is
+   * acceptable — pick something cheap rather than a slow business endpoint
+   * (a slow endpoint would make a healthy tunnel look dead).
    *
-   * Default "/" is intentionally cheap: it hits whatever the site serves at the
-   * root and a 2xx/3xx/4xx all count as "tunnel alive".
+   * MUST fall under one of apiPrefixes. Otherwise the Service Worker never
+   * intercepts it, the request always reaches nginx, and every connect attempt
+   * wrongly reports "tunnel down". The default satisfies this by sitting under
+   * the default prefix.
    */
   probePath: string;
 }
@@ -96,7 +98,7 @@ export const DEFAULT_SIGNALING_PROFILE: SignalingProfile = {
 export const DEFAULT_SITE_PROFILE: SiteProfile = {
   apiPrefixes: ["/api/"],
   neverTunnel: ["/api/auth/session"],
-  probePath: "/",
+  probePath: "/api/",
 };
 
 export const DEFAULT_SITE_CONFIG: SiteConfig = {
