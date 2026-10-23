@@ -23,6 +23,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"strings"
 	"syscall"
 	"time"
@@ -46,6 +47,7 @@ func main() {
 		turnUser   = flag.String("turn-user", "", "TURN username")
 		turnPass   = flag.String("turn-pass", "", "TURN credential")
 		insecure   = flag.Bool("insecure-upstream", false, "skip TLS verification against upstreams")
+		slots      = flag.Int("slots", 8, "signaling slots to hold; one per concurrent browser")
 		advCIDR    = flag.String("advertise-cidr", "", "comma-separated CIDRs; only host candidates inside them are advertised, e.g. 10.1.1.0/24,192.168.1.0/24 (srflx/relay always kept)")
 	)
 	flag.Parse()
@@ -95,19 +97,38 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	for {
-		if err := run(ctx, logger, *signalURL, *room, *secret, routes, webrtcConfig, advertiseNets); err != nil {
-			if errors.Is(err, context.Canceled) {
-				return
-			}
-			logger.Printf("session ended: %v; retrying in 3s", err)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(3 * time.Second):
-		}
+	// One signaling connection serves one browser: a WebRTC peer connection is
+	// point-to-point, so N concurrent browsers need N of them. The relay hands
+	// each browser a free agent connection, so the agent keeps a pool of slots
+	// rather than a single one — otherwise the second visitor waits forever.
+	slotCount := *slots
+	if slotCount < 1 {
+		slotCount = 1
 	}
+	logger.Printf("holding %d signaling slot(s) in room %q", slotCount, *room)
+
+	var wg sync.WaitGroup
+	for i := 0; i < slotCount; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			logger := log.New(os.Stderr, fmt.Sprintf("[tunnelagent#%d] ", n), log.LstdFlags|log.Lmicroseconds)
+			for {
+				if err := run(ctx, logger, *signalURL, *room, *secret, routes, webrtcConfig, advertiseNets); err != nil {
+					if errors.Is(err, context.Canceled) {
+						return
+					}
+					logger.Printf("session ended: %v; retrying in 3s", err)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(3 * time.Second):
+				}
+			}
+		}(i + 1)
+	}
+	wg.Wait()
 }
 
 // loadRoutes builds the route table from either a YAML file or -target.
@@ -147,7 +168,36 @@ func run(
 	defer func() { _ = client.Close() }()
 	logger.Printf("joined room %q via %s", room, signalURL)
 
-	var agent *tunnel.Agent
+	// Several browsers can share one signaling room now that the relay hands out
+	// a dedicated agent connection per browser. Keep one Agent (one WebRTC peer
+	// connection) per session id; a peer connection is point-to-point, so this
+	// is the minimum possible.
+	agents := make(map[string]*tunnel.Agent)
+	var agentsMu sync.Mutex
+
+	closeAgent := func(session string) {
+		agentsMu.Lock()
+		a := agents[session]
+		delete(agents, session)
+		agentsMu.Unlock()
+		if a != nil {
+			_ = a.Close()
+		}
+	}
+	closeAll := func() {
+		agentsMu.Lock()
+		all := agents
+		agents = make(map[string]*tunnel.Agent)
+		agentsMu.Unlock()
+		for _, a := range all {
+			_ = a.Close()
+		}
+	}
+	getAgent := func(session string) *tunnel.Agent {
+		agentsMu.Lock()
+		defer agentsMu.Unlock()
+		return agents[session]
+	}
 
 	awaitOffer := time.NewTimer(30 * time.Minute)
 	defer awaitOffer.Stop()
@@ -168,30 +218,30 @@ func run(
 	for {
 		select {
 		case <-ctx.Done():
-			if agent != nil {
-				_ = agent.Close()
-			}
+			closeAll()
 			return context.Canceled
 
 		case <-awaitOffer.C:
-			if agent == nil {
+			agentsMu.Lock()
+			any := len(agents) > 0
+			agentsMu.Unlock()
+			if !any {
 				return errors.New("no browser offer received within timeout")
 			}
 
 		case err := <-errCh:
-			if agent != nil {
-				_ = agent.Close()
-			}
+			closeAll()
 			return err
 
 		case m := <-msgCh:
 			switch m.Type {
 			case protocol.TypeOffer:
-				if agent != nil {
-					_ = agent.Close()
-				}
+				// A repeated offer for the same session replaces that session
+				// only; other browsers keep their connections.
+				closeAgent(m.Session)
+				session := m.Session
 				a, err := tunnel.New(webrtcConfig, routes, advertiseNets, func(c webrtc.ICECandidateInit) {
-					out := protocol.New(protocol.TypeCandidate, m.Session)
+					out := protocol.New(protocol.TypeCandidate, session)
 					out.Candidate = c.Candidate
 					if c.SDPMid != nil {
 						out.SDPMid = *c.SDPMid
@@ -219,7 +269,10 @@ func run(
 					continue
 				}
 
-				agent = a
+				agentsMu.Lock()
+				agents[m.Session] = a
+				agentsMu.Unlock()
+
 				out := protocol.New(protocol.TypeAnswer, m.Session)
 				out.SDP = answer
 				if err := client.Send(out); err != nil {
@@ -228,24 +281,22 @@ func run(
 				logger.Printf("answered offer for session %s", m.Session)
 
 			case protocol.TypeCandidate:
-				if agent == nil {
-					continue // candidates may arrive before the agent exists
+				a := getAgent(m.Session)
+				if a == nil {
+					continue // candidates may arrive before that session's offer
 				}
 				init := webrtc.ICECandidateInit{
 					Candidate:     m.Candidate,
 					SDPMid:        &m.SDPMid,
 					SDPMLineIndex: m.SDPMIndex,
 				}
-				if err := agent.AddCandidate(init); err != nil {
+				if err := a.AddCandidate(init); err != nil {
 					logger.Printf("add candidate: %v", err)
 				}
 
 			case protocol.TypeBye:
 				logger.Printf("peer said bye for session %s", m.Session)
-				if agent != nil {
-					_ = agent.Close()
-					agent = nil
-				}
+				closeAgent(m.Session)
 
 			case protocol.TypeHello, protocol.TypeReady:
 				logger.Printf("relay says %s", m.Type)

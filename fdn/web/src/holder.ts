@@ -6,11 +6,12 @@
  * RTCPeerConnection + MessagePort so that navigating between pages of the tab
  * never tears the tunnel down, and to re-establish it when it drops.
  *
- * Multiple tabs means multiple holders; the signaling room has a single
- * browser slot, so they must not race: every candidate waits a random jitter
- * and re-checks the overlay status before connecting, and any holder that sees
- * the overlay enabled stands down (its peer would replace the live one and
- * break the room pairing).
+ * The relay now gives each browser its own agent connection and the agent keys
+ * its peer connections by session id, so several tabs (or a tablet alongside a
+ * laptop) each keep their own tunnel instead of evicting one another. Holders
+ * still wait a random jitter and stand down when the overlay is already up —
+ * not to avoid clobbering a shared slot, but because a tab whose data plane is
+ * already live has no reason to open a second one.
  */
 
 import {
@@ -82,8 +83,8 @@ async function ensureConnected(): Promise<void> {
   if (connecting) return;
 
   connecting = true;
-  // Election jitter: with several tabs open, only one holder should hit the
-  // signaling room; the others re-check after their jitter and stand down.
+  // Jitter before dialing: a tab that is already connected should not open a
+  // second tunnel just because its holder remounted.
   await delay(300 + Math.random() * 1500);
 
   const recheck = await queryOverlayStatus();

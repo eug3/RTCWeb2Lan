@@ -27,39 +27,107 @@ func (p *Peer) Write(b []byte) error {
 	return p.conn.WriteMessage(websocket.TextMessage, b)
 }
 
-// Room holds the two peers.
+// Room pairs browsers with agent connections.
+//
+// A room used to hold exactly one browser and one agent, so a second visitor
+// (another tab, or a tablet alongside a laptop) replaced the first. The evicted
+// side saw its connection close, reconnected, and evicted the other in turn —
+// an endless connecting/closed cycle that surfaces as "peer connection timed
+// out" on a slow path.
+//
+// A room now keeps a pool of agent connections and binds each browser to its
+// own for the life of its session. One WebRTC peer connection per browser is
+// unavoidable (a peer connection is point-to-point), so the pool lives on the
+// agent side and the browser keeps its unchanged single-connection protocol.
 type Room struct {
-	mu      sync.Mutex
-	browser *Peer
-	agent   *Peer
+	mu sync.Mutex
+	// idle agents: connected, not yet bound to a browser.
+	idle []*Peer
+	// bound: browser -> the agent connection serving it.
+	bound map[*Peer]*Peer
+	// waiting: browsers that arrived before any agent was free.
+	waiting []*Peer
 }
 
-func (r *Room) set(role string, p *Peer) {
+func newRoom() *Room {
+	return &Room{bound: make(map[*Peer]*Peer)}
+}
+
+// addAgent registers an agent connection, binding it immediately to a browser
+// that is already waiting, if any.
+func (r *Room) addAgent(p *Peer) (browser *Peer) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if role == "agent" {
-		r.agent = p
+	if len(r.waiting) > 0 {
+		browser = r.waiting[0]
+		r.waiting = r.waiting[1:]
+		r.bound[browser] = p
+		return browser
+	}
+	r.idle = append(r.idle, p)
+	return nil
+}
+
+// addBrowser registers a browser, returning the agent connection bound to it
+// (nil when none is free yet).
+func (r *Room) addBrowser(p *Peer) (agent *Peer) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.idle) > 0 {
+		agent = r.idle[0]
+		r.idle = r.idle[1:]
+		r.bound[p] = agent
+		return agent
+	}
+	r.waiting = append(r.waiting, p)
+	return nil
+}
+
+// counterpart returns the peer the given one talks to.
+func (r *Room) counterpart(p *Peer) *Peer {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if p.role == "agent" {
+		for browser, agent := range r.bound {
+			if agent == p {
+				return browser
+			}
+		}
+		return nil
+	}
+	return r.bound[p]
+}
+
+// remove drops a peer and its binding, returning how many agent connections the
+// room still has (which tells the agent whether it must dial again).
+func (r *Room) remove(p *Peer) (agentsLeft int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if p.role == "agent" {
+		for i, idle := range r.idle {
+			if idle == p {
+				r.idle = append(r.idle[:i], r.idle[i+1:]...)
+				return len(r.idle) + len(r.bound)
+			}
+		}
+		for browser, agent := range r.bound {
+			if agent == p {
+				delete(r.bound, browser)
+				r.waiting = append(r.waiting, browser)
+				break
+			}
+		}
 	} else {
-		r.browser = p
+		delete(r.bound, p)
+		for i, w := range r.waiting {
+			if w == p {
+				r.waiting = append(r.waiting[:i], r.waiting[i+1:]...)
+				break
+			}
+		}
 	}
-}
-
-func (r *Room) other(role string) *Peer {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if role == "agent" {
-		return r.browser
-	}
-	return r.agent
-}
-
-func (r *Room) peer(role string) *Peer {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if role == "agent" {
-		return r.agent
-	}
-	return r.browser
+	return len(r.idle) + len(r.bound)
 }
 
 // Server is the relay.
@@ -140,18 +208,29 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	peer := &Peer{conn: conn, role: role}
 
 	room := s.getRoom(roomID)
-	room.set(role, peer)
-	s.log.Printf("room %s: %s joined", roomID, role)
+
+	var paired bool
+	if role == "agent" {
+		paired = room.addAgent(peer) != nil
+	} else {
+		paired = room.addBrowser(peer) != nil
+	}
+	s.log.Printf("room %s: %s joined (paired=%v)", roomID, role, paired)
 
 	defer func() {
-		s.log.Printf("room %s: %s left", roomID, role)
-		s.dropIfSame(roomID, room, role, peer)
+		left := room.remove(peer)
+		s.log.Printf("room %s: %s left (agents left=%d)", roomID, role, left)
+		s.dropIfEmpty(roomID, room, left)
 		_ = conn.Close()
 	}()
 
-	// Tell the newcomer whether the counterpart is present so the page can
-	// decide when it is safe to offer.
-	s.sendStatus(room, role)
+	// Ready frames are informational — the browser ignores them and offers on
+	// its own timer — but they keep the protocol honest for other clients.
+	if paired {
+		_ = peer.Write([]byte(`{"v":1,"type":"ready","state":"paired"}`))
+	} else {
+		_ = peer.Write([]byte(`{"v":1,"type":"ready","state":"waiting"}`))
+	}
 
 	for {
 		_, data, err := conn.ReadMessage()
@@ -159,9 +238,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		other := room.other(role)
+		other := room.counterpart(peer)
 		if other == nil {
-			// Nobody to relay to yet; tell the sender to wait.
+			// Nobody bound yet; tell the sender to wait.
 			_ = peer.Write([]byte(`{"v":1,"type":"waiting"}`))
 			continue
 		}
@@ -172,53 +251,31 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) sendStatus(room *Room, role string) {
-	state := "waiting"
-	if room.peer("agent") != nil && room.peer("browser") != nil {
-		state = "paired"
-	}
-	self := room.peer(role)
-	if self == nil {
-		return
-	}
-	_ = self.Write([]byte(`{"v":1,"type":"ready","state":"` + state + `"}`))
-
-	// When both sides are present, nudge both so the browser can start offering.
-	if state == "paired" {
-		for _, r := range []string{"agent", "browser"} {
-			if p := room.peer(r); p != nil {
-				_ = p.Write([]byte(`{"v":1,"type":"ready","state":"paired"}`))
-			}
-		}
-	}
-}
-
 func (s *Server) getRoom(id string) *Room {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if r, ok := s.rooms[id]; ok {
 		return r
 	}
-	r := &Room{}
+	r := newRoom()
 	s.rooms[id] = r
 	return r
 }
 
-func (s *Server) dropIfSame(id string, room *Room, role string, peer *Peer) {
+// dropIfEmpty forgets a room once it has no agent connection left. A room with
+// waiting browsers but no agent is kept, so a browser that arrived first is not
+// thrown away while the agent is still dialing.
+func (s *Server) dropIfEmpty(id string, room *Room, agentsLeft int) {
+	if agentsLeft > 0 {
+		return
+	}
 	room.mu.Lock()
-	if role == "agent" {
-		if room.agent == peer {
-			room.agent = nil
-		}
-	} else if room.browser == peer {
-		room.browser = nil
-	}
-	empty := room.agent == nil && room.browser == nil
+	hasWaiters := len(room.waiting) > 0
 	room.mu.Unlock()
-
-	if empty {
-		s.mu.Lock()
-		delete(s.rooms, id)
-		s.mu.Unlock()
+	if hasWaiters {
+		return
 	}
+	s.mu.Lock()
+	delete(s.rooms, id)
+	s.mu.Unlock()
 }

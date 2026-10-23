@@ -268,6 +268,28 @@ export interface ConnectFlowResult {
 /** How long we wait for a usable P2P link per attempt. */
 export const DEFAULT_CONNECT_TIMEOUT_MS = 15000;
 
+/**
+ * A stable per-page session id, scoped to one room.
+ *
+ * Kept in sessionStorage so a reload of the same tab keeps its identity (the
+ * agent can then replace its own stale peer connection rather than leaking a
+ * new one), while other tabs and other devices get their own.
+ */
+export function pageSessionId(room: string): string {
+  const key = "w2l-session-" + room;
+  try {
+    const existing = sessionStorage.getItem(key);
+    if (existing) return existing;
+    const id = room + "-" + Math.random().toString(36).slice(2, 10);
+    sessionStorage.setItem(key, id);
+    return id;
+  } catch {
+    // Private mode or storage disabled: a one-off id is still better than
+    // sharing the room name with every other visitor.
+    return room + "-" + Math.random().toString(36).slice(2, 10);
+  }
+}
+
 export async function connectFlow(options: ConnectFlowOptions): Promise<ConnectFlowResult> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
   const onStage = options.onStage ?? (() => {});
@@ -300,7 +322,14 @@ export async function connectFlow(options: ConnectFlowOptions): Promise<ConnectF
 
     peer = await withDeadline(
       connectAsInitiator({
-        session: options.room,
+        // A unique session id per page, not the room name.
+        //
+        // The relay hands each browser its own agent connection, and the agent
+        // keys its WebRTC peer connections by session id. Reusing the room name
+        // would make every tab share one id, so a second tab would still
+        // replace the first one's peer connection. The room stays the discovery
+        // channel; the session identifies this particular browser.
+        session: pageSessionId(options.room),
         signaling: makeSignalChannel(ws),
         config: { iceServers, connectTimeoutMs: timeoutMs },
         deps: {},
