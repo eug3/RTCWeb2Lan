@@ -54,7 +54,7 @@ func exchange(t *testing.T, routes *relay.RouteTable, request string) string {
 	<-gathered
 
 	logger := log.New(os.Stderr, "[agent-test] ", log.LstdFlags)
-	agent, err := tunnel.New(webrtc.Configuration{}, routes, nil, func(webrtc.ICECandidateInit) {}, logger)
+	agent, err := tunnel.New(webrtc.Configuration{}, routes, nil, nil, func(webrtc.ICECandidateInit) {}, logger)
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
@@ -181,6 +181,59 @@ func TestAgentReturns404ForUnknownHost(t *testing.T) {
 	resp := exchange(t, routes, "GET / HTTP/1.1\r\nHost: unknown.example.com\r\n\r\n")
 	if !strings.HasPrefix(resp, "HTTP/1.1 404") {
 		t.Fatalf("expected 404 for unknown host, got %s", head(resp))
+	}
+}
+
+// srflx-only admission must hold on BOTH channels to the browser: no trickled
+// candidate, and none embedded in the answer SDP. Without STUN the agent
+// gathers only host candidates, so a srflx-only agent must produce an answer
+// with zero candidate lines and trickle nothing.
+func TestAgentSrflxOnlyAdvertisesNothingWithoutStun(t *testing.T) {
+	target := startTarget(t)
+	routes, err := relay.SingleRoute(target.URL, false)
+	if err != nil {
+		t.Fatalf("single route: %v", err)
+	}
+
+	browser, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatalf("browser pc: %v", err)
+	}
+	t.Cleanup(func() { _ = browser.Close() })
+	if _, err := browser.CreateDataChannel(tunnel.ChannelLabel, nil); err != nil {
+		t.Fatalf("create data channel: %v", err)
+	}
+	offer, err := browser.CreateOffer(nil)
+	if err != nil {
+		t.Fatalf("create offer: %v", err)
+	}
+	gathered := webrtc.GatheringCompletePromise(browser)
+	if err := browser.SetLocalDescription(offer); err != nil {
+		t.Fatalf("set local offer: %v", err)
+	}
+	<-gathered
+
+	trickled := 0
+	agent, err := tunnel.New(
+		webrtc.Configuration{}, routes, nil,
+		[]webrtc.ICECandidateType{webrtc.ICECandidateTypeSrflx},
+		func(webrtc.ICECandidateInit) { trickled++ },
+		log.New(io.Discard, "", 0),
+	)
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+	t.Cleanup(func() { _ = agent.Close() })
+
+	answer, err := agent.HandleOffer(browser.LocalDescription().SDP)
+	if err != nil {
+		t.Fatalf("handle offer: %v", err)
+	}
+	if strings.Contains(answer, "a=candidate:") {
+		t.Errorf("srflx-only answer must embed no candidates (agent gathered host-only):\n%s", answer)
+	}
+	if trickled != 0 {
+		t.Errorf("srflx-only agent must trickle nothing without STUN, trickled %d", trickled)
 	}
 }
 

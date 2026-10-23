@@ -1,6 +1,7 @@
 package signaling_test
 
 import (
+	"context"
 	"log"
 	"net/http/httptest"
 	"os"
@@ -194,4 +195,44 @@ func TestRoomSurvivesWhileAgentsRemain(t *testing.T) {
 		return
 	}
 	t.Fatal("neither surviving agent served the new browser; the room was dropped")
+}
+// A connection must survive past the read deadline as long as the relay keeps
+// pinging. The bug this guards against: the client installed only a PongHandler,
+// but the relay sends Pings, so the client's own deadline was never refreshed
+// and every slot died at the 75s mark at the same instant.
+func TestAgentConnectionSurvivesRelayPings(t *testing.T) {
+	if testing.Short() {
+		t.Skip("timing test")
+	}
+	logger := log.New(os.Stderr, "[relay-test] ", log.LstdFlags)
+	srv := httptest.NewServer(signaling.NewServer(logger).Handler())
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Second)
+	defer cancel()
+
+	client, err := signaling.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/ws", "keepalive", "", logger)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	// Read in the background; any error means the deadline fired.
+	errCh := make(chan error, 1)
+	go func() {
+		for {
+			if _, err := client.Receive(); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+
+	// Past the old 75s deadline. The relay pings every 20s, so a healthy
+	// connection should still be alive here.
+	select {
+	case err := <-errCh:
+		t.Fatalf("connection died before the deadline window elapsed: %v", err)
+	case <-time.After(80 * time.Second):
+	}
 }

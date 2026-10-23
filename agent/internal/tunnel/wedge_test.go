@@ -53,7 +53,7 @@ func newAgentPeer(t *testing.T) *webrtc.PeerConnection {
 	if v := os.Getenv("W2L_TEST_VERBOSE"); v != "" {
 		logger = log.New(os.Stderr, "[agent-test] ", log.LstdFlags)
 	}
-	agent, err := tunnel.New(webrtc.Configuration{}, routes, nil, func(webrtc.ICECandidateInit) {}, logger)
+	agent, err := tunnel.New(webrtc.Configuration{}, routes, nil, nil, func(webrtc.ICECandidateInit) {}, logger)
 	if err != nil {
 		t.Fatalf("agent: %v", err)
 	}

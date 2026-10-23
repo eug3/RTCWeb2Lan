@@ -16,15 +16,15 @@ package main
 
 import (
 	"context"
-	"net"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
-	"sync"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -49,6 +49,7 @@ func main() {
 		insecure   = flag.Bool("insecure-upstream", false, "skip TLS verification against upstreams")
 		slots      = flag.Int("slots", 8, "signaling slots to hold; one per concurrent browser")
 		advCIDR    = flag.String("advertise-cidr", "", "comma-separated CIDRs; only host candidates inside them are advertised, e.g. 10.1.1.0/24,192.168.1.0/24 (srflx/relay always kept)")
+		advTypes   = flag.String("advertise-types", "", "comma-separated candidate types to advertise: host, srflx, relay (empty = all); e.g. srflx for a NAT-punching-only connection test")
 	)
 	flag.Parse()
 
@@ -94,6 +95,32 @@ func main() {
 		logger.Printf("advertising host candidates only inside %v", advertiseNets)
 	}
 
+	// Candidate-type admission, applied to trickled candidates AND to the
+	// candidate lines embedded in the answer SDP. "srflx" alone turns the agent
+	// into a NAT-punching-only test peer: no reachable address of the agent
+	// itself is ever offered, so a connection proves the srflx path works.
+	var advertiseTypes []webrtc.ICECandidateType
+	if *advTypes != "" {
+		for _, part := range splitList(*advTypes) {
+			typ, err := webrtc.NewICECandidateType(part)
+			if err != nil || typ == webrtc.ICECandidateTypePrflx {
+				logger.Fatalf("invalid -advertise-types entry %q (want host, srflx, relay)", part)
+			}
+			advertiseTypes = append(advertiseTypes, typ)
+		}
+		typeHostAllowed := false
+		for _, t := range advertiseTypes {
+			if t == webrtc.ICECandidateTypeHost {
+				typeHostAllowed = true
+				break
+			}
+		}
+		logger.Printf("advertising only candidate types %v", advertiseTypes)
+		if !typeHostAllowed && len(iceServers) == 0 {
+			logger.Printf("WARNING: -advertise-types excludes host and no -stun/-turn is configured; nothing will be advertised and no connection is possible")
+		}
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -114,7 +141,7 @@ func main() {
 			defer wg.Done()
 			logger := log.New(os.Stderr, fmt.Sprintf("[tunnelagent#%d] ", n), log.LstdFlags|log.Lmicroseconds)
 			for {
-				if err := run(ctx, logger, *signalURL, *room, *secret, routes, webrtcConfig, advertiseNets); err != nil {
+				if err := run(ctx, logger, *signalURL, *room, *secret, routes, webrtcConfig, advertiseNets, advertiseTypes); err != nil {
 					if errors.Is(err, context.Canceled) {
 						return
 					}
@@ -160,6 +187,7 @@ func run(
 	routes *relay.RouteTable,
 	webrtcConfig webrtc.Configuration,
 	advertiseNets []*net.IPNet,
+	advertiseTypes []webrtc.ICECandidateType,
 ) error {
 	client, err := signaling.Dial(ctx, signalURL, room, secret, logger)
 	if err != nil {
@@ -240,7 +268,7 @@ func run(
 				// only; other browsers keep their connections.
 				closeAgent(m.Session)
 				session := m.Session
-				a, err := tunnel.New(webrtcConfig, routes, advertiseNets, func(c webrtc.ICECandidateInit) {
+				a, err := tunnel.New(webrtcConfig, routes, advertiseNets, advertiseTypes, func(c webrtc.ICECandidateInit) {
 					out := protocol.New(protocol.TypeCandidate, session)
 					out.Candidate = c.Candidate
 					if c.SDPMid != nil {
