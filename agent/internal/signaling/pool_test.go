@@ -236,3 +236,51 @@ func TestAgentConnectionSurvivesRelayPings(t *testing.T) {
 	case <-time.After(80 * time.Second):
 	}
 }
+
+// When a browser departs, the agent it was paired with must be recycled into
+// the idle pool (or immediately bound to any waiting browser) and must receive
+// a "bye" frame so it knows to release the peer connection.
+func TestAgentRecycledToIdleWhenBrowserLeaves(t *testing.T) {
+	logger := log.New(os.Stderr, "[relay-test] ", log.LstdFlags)
+	srv := httptest.NewServer(signaling.NewServer(logger).Handler())
+	defer srv.Close()
+
+	// A single agent connects and sits idle.
+	agent := dial(t, srv.URL, "recycle", "agent")
+	defer func() { _ = agent.Close() }()
+
+	// First browser arrives and pairs.
+	browser1 := dial(t, srv.URL, "recycle", "browser")
+	send(t, browser1, "offer-1")
+	expect(t, agent, "offer-1", "offer forwarded to agent")
+
+	// Browser 1 departs.
+	_ = browser1.Close()
+
+	// The agent must receive a bye frame followed by ready:waiting.
+	expect(t, agent, `{"v":1,"type":"bye"}`, "bye notification on browser leave")
+	expect(t, agent, `{"v":1,"type":"ready","state":"waiting"}`, "ready waiting notification on returning to idle")
+
+	// Second browser arrives. The agent was recycled and MUST be paired with it.
+	browser2 := dial(t, srv.URL, "recycle", "browser")
+	defer func() { _ = browser2.Close() }()
+
+	send(t, browser2, "offer-2")
+	expect(t, agent, "offer-2", "offer-2 forwarded to recycled agent")
+
+	// Reply back to browser 2.
+	send(t, agent, "answer-2")
+	expect(t, browser2, "answer-2", "answer-2 forwarded to browser 2")
+
+	// Browser 2 departs as well.
+	_ = browser2.Close()
+	expect(t, agent, `{"v":1,"type":"bye"}`, "bye notification on second browser leave")
+	expect(t, agent, `{"v":1,"type":"ready","state":"waiting"}`, "ready waiting notification on second browser leave")
+
+	// Third browser arrives. The agent must still be usable.
+	browser3 := dial(t, srv.URL, "recycle", "browser")
+	defer func() { _ = browser3.Close() }()
+
+	send(t, browser3, "offer-3")
+	expect(t, agent, "offer-3", "offer-3 forwarded to recycled agent on 3rd visit")
+}

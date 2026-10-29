@@ -120,11 +120,32 @@ func (r *Room) remove(p *Peer) (agentsLeft int) {
 			}
 		}
 	} else {
-		delete(r.bound, p)
+		var pairedAgent *Peer
+		for browser, agent := range r.bound {
+			if browser == p {
+				pairedAgent = agent
+				delete(r.bound, browser)
+				break
+			}
+		}
 		for i, w := range r.waiting {
 			if w == p {
 				r.waiting = append(r.waiting[:i], r.waiting[i+1:]...)
 				break
+			}
+		}
+		if pairedAgent != nil {
+			// Notify the paired agent that its browser departed so it can tear down the session.
+			_ = pairedAgent.Write([]byte(`{"v":1,"type":"bye"}`))
+			if len(r.waiting) > 0 {
+				nextBrowser := r.waiting[0]
+				r.waiting = r.waiting[1:]
+				r.bound[nextBrowser] = pairedAgent
+				_ = pairedAgent.Write([]byte(`{"v":1,"type":"ready","state":"paired"}`))
+				_ = nextBrowser.Write([]byte(`{"v":1,"type":"ready","state":"paired"}`))
+			} else {
+				r.idle = append(r.idle, pairedAgent)
+				_ = pairedAgent.Write([]byte(`{"v":1,"type":"ready","state":"waiting"}`))
 			}
 		}
 	}

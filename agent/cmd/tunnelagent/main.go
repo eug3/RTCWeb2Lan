@@ -47,7 +47,7 @@ func main() {
 		turnUser   = flag.String("turn-user", "", "TURN username")
 		turnPass   = flag.String("turn-pass", "", "TURN credential")
 		insecure   = flag.Bool("insecure-upstream", false, "skip TLS verification against upstreams")
-		slots      = flag.Int("slots", 8, "signaling slots to hold; one per concurrent browser")
+		slots      = flag.Int("slots", 32, "signaling slots to hold; one per concurrent browser")
 		advCIDR    = flag.String("advertise-cidr", "", "comma-separated CIDRs; only host candidates inside them are advertised, e.g. 10.1.1.0/24,192.168.1.0/24 (srflx/relay always kept)")
 		advTypes   = flag.String("advertise-types", "", "comma-separated candidate types to advertise: host, srflx, relay (empty = all); e.g. srflx for a NAT-punching-only connection test")
 	)
@@ -227,8 +227,22 @@ func run(
 		return agents[session]
 	}
 
-	awaitOffer := time.NewTimer(30 * time.Minute)
-	defer awaitOffer.Stop()
+	lastActive := time.Now()
+	var lastActiveMu sync.Mutex
+	touch := func() {
+		lastActiveMu.Lock()
+		lastActive = time.Now()
+		lastActiveMu.Unlock()
+	}
+	getLastActive := func() time.Time {
+		lastActiveMu.Lock()
+		defer lastActiveMu.Unlock()
+		return lastActive
+	}
+
+	idleTicker := time.NewTicker(1 * time.Minute)
+	defer idleTicker.Stop()
+	const maxIdleDuration = 30 * time.Minute
 
 	msgCh := make(chan protocol.Message, 16)
 	errCh := make(chan error, 1)
@@ -249,12 +263,13 @@ func run(
 			closeAll()
 			return context.Canceled
 
-		case <-awaitOffer.C:
+		case <-idleTicker.C:
 			agentsMu.Lock()
-			any := len(agents) > 0
+			count := len(agents)
 			agentsMu.Unlock()
-			if !any {
-				return errors.New("no browser offer received within timeout")
+			if count == 0 && time.Since(getLastActive()) > maxIdleDuration {
+				closeAll()
+				return errors.New("no browser activity within idle timeout; cycling connection")
 			}
 
 		case err := <-errCh:
@@ -287,6 +302,14 @@ func run(
 					continue
 				}
 
+				a.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+					if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed {
+						logger.Printf("peer connection for session %s terminated (%s); closing agent", session, s)
+						closeAgent(session)
+						touch()
+					}
+				})
+
 				answer, err := a.HandleOffer(m.SDP)
 				if err != nil {
 					logger.Printf("handle offer: %v", err)
@@ -300,6 +323,7 @@ func run(
 				agentsMu.Lock()
 				agents[m.Session] = a
 				agentsMu.Unlock()
+				touch()
 
 				out := protocol.New(protocol.TypeAnswer, m.Session)
 				out.SDP = answer
@@ -309,6 +333,7 @@ func run(
 				logger.Printf("answered offer for session %s", m.Session)
 
 			case protocol.TypeCandidate:
+				touch()
 				a := getAgent(m.Session)
 				if a == nil {
 					continue // candidates may arrive before that session's offer
@@ -323,11 +348,22 @@ func run(
 				}
 
 			case protocol.TypeBye:
-				logger.Printf("peer said bye for session %s", m.Session)
-				closeAgent(m.Session)
+				if m.Session != "" {
+					logger.Printf("peer said bye for session %s", m.Session)
+					closeAgent(m.Session)
+				} else {
+					logger.Printf("peer left (relay said bye); closing all active sessions on this slot")
+					closeAll()
+				}
+				touch()
 
 			case protocol.TypeHello, protocol.TypeReady:
-				logger.Printf("relay says %s", m.Type)
+				logger.Printf("relay says %s (%s)", m.Type, m.State)
+				if m.Type == protocol.TypeReady && m.State == "waiting" {
+					// If the relay placed this slot back to waiting (idle), ensure all prior session agents are cleaned up.
+					closeAll()
+					touch()
+				}
 
 			case protocol.TypeError:
 				logger.Printf("relay/browser error: %s", m.Message)

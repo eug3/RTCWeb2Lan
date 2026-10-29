@@ -37,10 +37,11 @@ type Agent struct {
 	advertiseCIDRs []*net.IPNet
 	advertiseTypes []webrtc.ICECandidateType
 
-	mu      sync.Mutex
-	relayed bool
-	mux     *muxConn
-	jars    map[string]http.CookieJar // one jar per target
+	mu            sync.Mutex
+	relayed       bool
+	mux           *muxConn
+	jars          map[string]http.CookieJar // one jar per target
+	onStateChange func(webrtc.PeerConnectionState)
 }
 
 // New creates an agent. onCandidate is called for locally gathered candidates.
@@ -106,6 +107,12 @@ func New(
 
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		logger.Printf("connection state: %s", s)
+		a.mu.Lock()
+		cb := a.onStateChange
+		a.mu.Unlock()
+		if cb != nil {
+			cb(s)
+		}
 	})
 
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
@@ -367,4 +374,12 @@ func (a *Agent) httpClient(target *relay.Target) *http.Client {
 			return http.ErrUseLastResponse
 		},
 	}
+}
+
+// OnConnectionStateChange registers a callback that fires whenever the underlying
+// PeerConnection state changes.
+func (a *Agent) OnConnectionStateChange(f func(webrtc.PeerConnectionState)) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.onStateChange = f
 }

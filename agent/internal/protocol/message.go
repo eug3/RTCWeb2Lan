@@ -26,6 +26,7 @@ type Message struct {
 	Type      string  `json:"type"`
 	Session   string  `json:"session,omitempty"`
 	Role      string  `json:"role,omitempty"`
+	State     string  `json:"state,omitempty"`
 	SDP       string  `json:"sdp,omitempty"`
 	Candidate string  `json:"candidate,omitempty"`
 	SDPMid    string  `json:"sdpMid,omitempty"`
