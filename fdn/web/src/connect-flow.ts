@@ -10,7 +10,7 @@
 
 import { attachDataPlane, instanceFromPeer, runExchange } from "./data-plane.js";
 import { encodeRequest, parseResponse } from "./http1.js";
-import { connectAsInitiator, type PeerConnectionHandle, type SignalChannel } from "./peer.js";
+import { connectAsInitiator, type PeerConnectionHandle, type SelectedPair, type SignalChannel } from "./peer.js";
 import type { SignalMessage } from "./signaling.js";
 
 /** One HTTP exchange straight over the peer connection, bypassing the SW. */
@@ -377,6 +377,32 @@ export async function connectFlow(options: ConnectFlowOptions): Promise<ConnectF
   const kind = peer.isRelayed ? "经 TURN 中转" : "P2P 直连";
   onStage({ stage: "done", kind });
   return { peer };
+}
+
+/**
+ * What to tell the visitor about where the link actually lands.
+ *
+ * The agent advertises every address it can be reached on (EasyTier
+ * 10.1.1.229, LAN 192.168.1.229, a public srflx one) and ICE probes them in
+ * parallel; the winner tells you which network the page came in over. The
+ * configured target is only a label — the agent resolves the real one from its
+ * own routes.yaml — so say so rather than presenting it as fact.
+ */
+export function describeLink(
+  pair: SelectedPair | null,
+  target: string | null,
+): { ip: string; detail: string } {
+  const reach = target ? `目标 ${target}` : "目标按 Host 由内网 agent 解析";
+  if (!pair || (!pair.local && !pair.remote)) {
+    return { ip: "协商中", detail: reach + " · 候选地址探测中" };
+  }
+  const link =
+    "本机 " +
+    (pair.local ?? "?") +
+    " ⇋ 内网 " +
+    (pair.remote ?? "?") +
+    (pair.remoteType ? "（" + pair.remoteType + "）" : "");
+  return { ip: pair.remote ?? pair.local ?? "协商中", detail: reach + " · " + link };
 }
 
 export function withDeadline<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {

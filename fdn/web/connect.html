@@ -75,6 +75,23 @@
       .diag a { color: var(--ink-faint); text-decoration: none; }
       .diag a:hover { color: var(--ink-soft); }
 
+      /* ---- which intranet address we are welding onto ---- */
+      .target {
+        margin: 12px 0 0; padding: 9px 12px; text-align: left;
+        border: 1px solid var(--line); border-radius: 9px; background: #fbfcfd;
+      }
+      .target-row { display: flex; align-items: baseline; gap: 7px; }
+      .target-k { font-size: 11px; color: var(--ink-faint); letter-spacing: .3px; white-space: nowrap; }
+      .target-v {
+        font-size: 15px; font-weight: 650; letter-spacing: .2px; color: var(--ink);
+        font-variant-numeric: tabular-nums; word-break: break-all;
+      }
+      .target-v.done { color: var(--accent); }
+      #link-detail {
+        margin-top: 3px; font-size: 11px; color: var(--ink-faint);
+        font-variant-numeric: tabular-nums; word-break: break-all;
+      }
+
       /* ---- the welding monster (compact) ---- */
       .scene { width: 168px; height: auto; display: block; margin: 0 auto; }
 
@@ -217,6 +234,14 @@
       <p class="sub">浏览器 ⇋ 内网，直连中</p>
       <div id="stage">准备中…</div>
       <div id="attempt"></div>
+
+      <div class="target">
+        <div class="target-row">
+          <span class="target-k">正在连接</span>
+          <span class="target-v" id="target">—</span>
+        </div>
+        <div id="link-detail"></div>
+      </div>
 
       <div id="failbox">
         <div id="reason"></div>

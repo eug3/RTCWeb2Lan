@@ -8,9 +8,17 @@
  * page unloads.
  */
 
-import { connectFlow, ensureOurWorker, rememberEndpoint, type ConnectStage } from "./connect-flow.js";
+import {
+  connectFlow,
+  describeLink,
+  ensureOurWorker,
+  rememberEndpoint,
+  type ConnectStage,
+} from "./connect-flow.js";
 import { loadSiteConfig, pushConfigToServiceWorker } from "./config-loader.js";
 import { DEFAULT_SITE_CONFIG, DEFAULT_SIGNALING_PROFILE, type SignalingProfile } from "./config.js";
+import type { PeerConnectionHandle } from "./peer.js";
+import { targetLabelFor } from "./router.js";
 
 const ASSET_BASE = (() => {
   const path = window.location.pathname;
@@ -29,6 +37,8 @@ const stageEl = el<HTMLDivElement>("stage");
 const attemptEl = el<HTMLDivElement>("attempt");
 const failBox = el<HTMLDivElement>("failbox");
 const reasonEl = el<HTMLDivElement>("reason");
+const targetEl = el<HTMLSpanElement>("target");
+const linkDetailEl = el<HTMLDivElement>("link-detail");
 
 const STAGE_TEXT: Record<string, string> = {
   signaling: "连接信令服务器…",
@@ -64,6 +74,50 @@ let endpoint = readEndpoint(DEFAULT_SIGNALING_PROFILE);
  */
 let probePath = DEFAULT_SITE_CONFIG.site.probePath;
 
+/**
+ * Intranet service this page stands in for, shown as "正在连接 <addr>".
+ *
+ * From the configured host rule, so a deployment that routes by Host alone
+ * (no browser-side target) degrades to a plain hint instead of inventing an
+ * address. It is a label only: the agent resolves the real target itself.
+ */
+let targetLabel: string | null = targetLabelFor(location.hostname, DEFAULT_SITE_CONFIG.routes)?.authority ?? null;
+
+/** The tunnel we welded, kept so the page can report the pair that won. */
+let livePeer: PeerConnectionHandle | null = null;
+
+function showTarget(): void {
+  targetEl.textContent = targetLabel ?? "内网服务（按 Host 解析）";
+}
+
+function showLink(/* display-only: never let this break the connect flow */): void {  const peer = livePeer;
+  if (!peer) {
+    showTarget();
+    linkDetailEl.textContent = "";
+    return;
+  }
+  void peer
+    .selectedPair()
+    .then((pair) => {
+      // A stale answer must not overwrite a newer state.
+      if (livePeer !== peer) return;
+      const d = describeLink(pair, targetLabel);
+      targetEl.textContent = d.ip;
+      linkDetailEl.textContent = d.detail;
+      targetEl.classList.toggle("done", pair !== null);
+    })
+    .catch(() => showTarget());
+}
+
+/** Poll the link label: ICE settles a moment after connect, and can re-select. */
+let linkTimer: number | undefined;
+
+function watchLink(): void {
+  if (linkTimer !== undefined) return;
+  showLink();
+  linkTimer = window.setInterval(showLink, 1000);
+}
+
 function setStage(text: string, cls: "" | "ok" | "bad" = ""): void {
   stageEl.textContent = text;
   stageEl.style.color = cls === "ok" ? "#46d78a" : cls === "bad" ? "#ff9f8a" : "#ffd166";
@@ -87,17 +141,24 @@ function setCookie(name: string, maxAgeSec: number): void {
 
 const failures: string[] = [];
 
+function stopWatchingLink(): void {
+  if (linkTimer === undefined) return;
+  window.clearInterval(linkTimer);
+  linkTimer = undefined;
+}
+
 async function tryConnect(): Promise<boolean> {
   failures.length = 0;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     attemptEl.textContent = "尝试 " + attempt + " / " + MAX_ATTEMPTS;
     try {
-      await connectFlow({
+      const { peer } = await connectFlow({
         ...endpoint,
         probePath,
         timeoutMs: CONNECT_TIMEOUT_MS,
         onStage: (s) => onStage(s, attempt),
       });
+      livePeer = peer;
       return true;
     } catch (error) {
       failures.push(
@@ -114,6 +175,10 @@ function showFailure(): void {
   attemptEl.textContent = "";
   reasonEl.textContent = failures.join("；");
   failBox.style.display = "block";
+  stopWatchingLink();
+  // Still say where the link is heading — through nginx this time.
+  showTarget();
+  linkDetailEl.textContent = "此刻尚未打通，下面会经 nginx 反代进入";
 }
 
 function finish(): void {
@@ -122,11 +187,15 @@ function finish(): void {
   // The attempt counter is a retry hint; on success it is just noise.
   attemptEl.textContent = "";
   failBox.style.display = "none";
+  // Show the address that actually answered before we leave this page. The
+  // redirect is held briefly so the label can settle from "协商中" to the
+  // winning pair; if the read is slow we still leave on time.
+  watchLink();
   // w2l_grace: while the SPA boots and its holder iframe reconnects, "/"
   // must pass through even though the overlay is briefly down.
   setCookie("w2l_grace", 60);
   document.cookie = "w2l_direct=; path=/; max-age=0; SameSite=Lax";
-  setTimeout(() => location.replace("/"), 750);
+  setTimeout(() => location.replace("/"), 1100);
 }
 
 async function boot(): Promise<void> {
@@ -137,7 +206,9 @@ async function boot(): Promise<void> {
   if (config) {
     endpoint = readEndpoint(config.signaling);
     probePath = config.site.probePath;
+    targetLabel = targetLabelFor(location.hostname, config.routes)?.authority ?? null;
   }
+  showTarget();
 
   el<HTMLAnchorElement>("diag-link").href =
     ASSET_BASE + "/?signal=" + encodeURIComponent(endpoint.signalUrl) + "&room=" + encodeURIComponent(endpoint.room);

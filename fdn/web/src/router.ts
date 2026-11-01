@@ -104,3 +104,23 @@ export function resolveRoute(
     authority: targetToAuthority(target),
   };
 }
+
+/**
+ * Which intranet service this page stands in for, as shown on the connect page
+ * ("正在连接 10.1.1.230:9011").
+ *
+ * The browser never names the target itself: in route-table mode the request
+ * carries the public Host and the agent resolves it with its own routes.yaml.
+ * The configured rule is therefore a label, not an instruction — when the
+ * deployment did not configure one (or the host only has prefix rules), report
+ * null and let the page say "按 Host 由内网 agent 解析".
+ */
+export function targetLabelFor(
+  hostname: string,
+  rules: readonly RouteRule[],
+): { authority: string; target: OverlayTarget } | null {
+  const host = hostname.toLowerCase();
+  const rule = rules.find((r) => r.kind === "host" && r.host.toLowerCase() === host);
+  if (!rule || rule.kind !== "host") return null;
+  return { authority: targetToAuthority(rule.target), target: rule.target };
+}

@@ -27,6 +27,17 @@ export interface SignalChannel {
   onMessage(handler: (msg: SignalMessage) => void): void;
 }
 
+/** The candidate pair connectivity checks actually agreed on. */
+export interface SelectedPair {
+  /** Browser-side address of the pair ("ip:port"). */
+  local: string | null;
+  /** Agent-side address of the pair ("ip:port"). */
+  remote: string | null;
+  /** "host" | "srflx" | "prflx" | "relay", or null if unparsed. */
+  localType: string | null;
+  remoteType: string | null;
+}
+
 export interface PeerConnectionHandle {
   /** Open a fresh DataChannel for one HTTP request. */
   openChannel(): RTCDataChannel;
@@ -34,6 +45,15 @@ export interface PeerConnectionHandle {
   localCandidateType: string | null;
   remoteCandidateType: string | null;
   isRelayed: boolean;
+  /**
+   * The pair carrying traffic, or null before ICE has picked one.
+   *
+   * The agent advertises several candidate addresses (EasyTier 10.1.1.229,
+   * the LAN 192.168.1.229, and a public srflx one); the browser probes them in
+   * parallel and this reports the winner. Callers must tolerate null and
+   * rejections: this is display-only and must never affect the connection.
+   */
+  selectedPair(): Promise<SelectedPair | null>;
   close(): void;
 }
 
@@ -235,11 +255,77 @@ function makeHandle(
     get isRelayed() {
       return localType() === "relay" || remoteType() === "relay";
     },
+    selectedPair: () => readSelectedPair(pc),
     close() {
       signaling.send({ v: SIGNAL_PROTOCOL_VERSION, type: "bye", session });
       pc.close();
     },
   };
+}
+
+/**
+ * The candidate fields the stats API exposes. lib.dom.d.ts has no type for
+ * `local-candidate` / `remote-candidate` stats at all, so declare the shape we
+ * actually read; candidate pairs sit beside them in the same report.
+ */
+interface IceCandidateStat {
+  id: string;
+  type: string;
+  address?: string;
+  port?: number;
+  candidateType?: string;
+}
+
+/** A candidate pair plus the `selected` flag newer typings omit. */
+type CandidatePairStat = RTCIceCandidatePairStats & { selected?: boolean };
+
+/**
+ * Ask the SDP for the candidate pair ICE settled on.
+ *
+ * Everything here is display-only, so it must never throw and never be awaited
+ * on a path that can fail: browsers without getStats() (or a stats call that
+ * rejects mid-teardown) simply report null and the page says "协商中".
+ */
+async function readSelectedPair(pc: RTCPeerConnection): Promise<SelectedPair | null> {
+  try {
+    if (typeof pc.getStats !== "function") return null;
+    const stats = await pc.getStats();
+    const found: Array<CandidatePairStat> = [];
+    const candidates = new Map<string, IceCandidateStat>();
+
+    stats.forEach((raw) => {
+      const s = raw as unknown as CandidatePairStat & IceCandidateStat;
+      if (s.type === "candidate-pair") {
+        const usable = s.state === "succeeded" || s.selected === true;
+        if (usable && s.nominated !== false) found.push(s);
+        return;
+      }
+      if (s.type === "local-candidate" || s.type === "remote-candidate") {
+        candidates.set(s.id, s);
+      }
+    });
+
+    // A browser-flagged selected pair wins; otherwise the first usable one.
+    const pair = found.find((p) => p.selected === true) ?? found[0];
+    if (!pair) return null;
+    const local = candidates.get(pair.localCandidateId);
+    const remote = candidates.get(pair.remoteCandidateId);
+    const addr = (c?: IceCandidateStat) =>
+      c?.address
+        ? c.address.includes(":")
+          ? `[${c.address}]:${c.port}`
+          : `${c.address}:${c.port}`
+        : null;
+
+    return {
+      local: addr(local),
+      remote: addr(remote),
+      localType: local?.candidateType ?? null,
+      remoteType: remote?.candidateType ?? null,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, what: string): Promise<T> {
