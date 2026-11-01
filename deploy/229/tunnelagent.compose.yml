@@ -1,0 +1,42 @@
+# tunnelagent on 229 — the ONE agent that serves room "lan".
+#
+# 229 must run exactly one agent. Two (this container plus a systemd unit, or
+# two containers) put 64 slots in the room, half of them on stale code, and the
+# relay then hands browsers to whichever answers first. The systemd unit
+# `web2lan-agent` must stay disabled:
+#
+#   sudo systemctl disable --now web2lan-agent
+#
+# network_mode: host is required, not a convenience: the agent's ICE candidates
+# are the host's own interfaces (10.1.1.229 over EasyTier, 192.168.1.229 on the
+# LAN). On a bridge network it would advertise 172.x container addresses that
+# no browser can reach, and P2P would silently degrade to srflx-only.
+#
+# Image: built on the host from the release binary, tagged by build date and
+# commit prefix. See deploy/229/README.md for the build commands.
+services:
+  tunnelagent:
+    image: rtcweb2lan/tunnelagent:20261101-f2850b5
+    container_name: tunnelagent
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - /home/beijihu/web2lan/routes.yaml:/app/routes.yaml:ro
+    command:
+      - -signal
+      - wss://sense.jshuaxin.net/__lan/ws
+      - -room
+      - lan
+      - -routes
+      - /app/routes.yaml
+      # One slot per concurrent browser. 32 is the ceiling; the relay hands each
+      # browser its own slot and recycles it when the browser goes away.
+      - -slots
+      - "32"
+      # Advertise host candidates on the EasyTier network and the office LAN.
+      # Dropping the second CIDR removes the LAN path for a browser sitting in
+      # the same subnet; dropping both leaves only srflx, which needs a cone NAT.
+      - -advertise-cidr
+      - 10.1.1.0/24,192.168.0.0/20
+      - -stun
+      - stun:stun.chat.bilibili.com:3478
