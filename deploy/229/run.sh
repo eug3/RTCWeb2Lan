@@ -10,7 +10,7 @@
 # leftover from a previous image never keeps running alongside the new one.
 set -euo pipefail
 
-IMAGE=${IMAGE:-rtcweb2lan/tunnelagent:20261101-f2850b5}
+IMAGE=${IMAGE:-rtcweb2lan/tunnelagent:20261101-quiet}
 ROUTES=${ROUTES:-/home/beijihu/web2lan/routes.yaml}
 
 # A systemd unit must not coexist with this container: both would hold a full

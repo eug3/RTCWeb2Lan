@@ -307,17 +307,12 @@ func run(
 						logger.Printf("peer connection for session %s terminated (%s); closing agent", session, s)
 						closeAgent(session)
 						touch()
-						// Free the slot instead of squatting on a browser that is
-						// already reconnecting. The relay keeps this connection
-						// bound to that browser for the life of the socket, so a
-						// slot whose peer failed is lost until the browser closes
-						// its WebSocket — which a page that gave up mid-attempt
-						// never does. Closing our side tells the relay to recycle
-						// the slot; this goroutine dials a fresh one in 3s.
-						select {
-						case errCh <- errPeerGone:
-						default:
-						}
+						// Keep the slot. Dropping the signaling connection here
+						// used to look like a way to recycle it, but a slot can
+						// serve several sessions and the page gives its slot back
+						// itself (detach on success, close on failure). Tearing the
+						// connection down on one failed peer only made every other
+						// session on it flap.
 					}
 				})
 
@@ -382,8 +377,5 @@ func run(
 		}
 	}
 }
-
-// errPeerGone ends one signaling session so its slot can be re-dialed.
-var errPeerGone = errors.New("peer connection failed; recycling signaling slot")
 
 var _ = fmt.Sprintf

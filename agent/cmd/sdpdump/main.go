@@ -33,6 +33,7 @@ func main() {
 	room := flag.String("room", "lan", "room")
 	stun := flag.String("stun", "stun:stun.chat.bilibili.com:3478", "comma-separated STUN URLs")
 	wait := flag.Duration("wait", 6*time.Second, "how long to collect trickled candidates after the answer")
+	verbose := flag.Bool("v", false, "print each trickled candidate as it arrives")
 	flag.Parse()
 
 	u, _ := url.Parse(*signalURL)
@@ -62,6 +63,7 @@ func main() {
 
 	session := "sdpdump-" + time.Now().Format("150405")
 	remote := map[string]bool{}
+	fromAnswer := map[string]bool{}
 	if _, err := pc.CreateDataChannel("http", nil); err != nil {
 		log.Fatalf("channel: %v", err)
 	}
@@ -87,7 +89,7 @@ func main() {
 		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			continue
+			break // closed or timed out; nothing more to read
 		}
 		var m signal
 		if json.Unmarshal(data, &m) != nil {
@@ -96,10 +98,18 @@ func main() {
 		switch m.Type {
 		case "answer":
 			answer = m.SDP
+			for _, line := range strings.Split(m.SDP, "\n") {
+				if strings.HasPrefix(strings.TrimSpace(line), "a=candidate:") {
+					fromAnswer[strings.TrimSpace(line)] = true
+				}
+			}
 			_ = pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: m.SDP})
 			fmt.Printf("answer received for %s (%d bytes)\n", session, len(m.SDP))
 		case "candidate":
 			remote[m.Candidate] = true
+			if *verbose {
+				fmt.Printf("trickle [session=%q]: %s\n", m.Session, m.Candidate)
+			}
 		case "error":
 			fmt.Fprintf(os.Stderr, "agent error: %+v\n", m)
 		}
@@ -143,6 +153,7 @@ func main() {
 	}
 	sort.Strings(out)
 
+	fmt.Printf("from answer SDP: %d, from trickle: %d\n", len(fromAnswer), len(remote))
 	fmt.Printf("advertised candidates (%d unique):\n", len(out))
 	for _, l := range out {
 		f := strings.Fields(l)

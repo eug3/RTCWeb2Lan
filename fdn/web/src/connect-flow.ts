@@ -30,6 +30,13 @@ function exchangeOverPeer(
 
 export function makeSignalChannel(ws: WebSocket): SignalChannel {
   const handlers: Array<(m: SignalMessage) => void> = [];
+  // Frames that arrive before anyone subscribed.
+  //
+  // The agent starts gathering the moment it has the offer, so its candidates
+  // can beat our listener: without this buffer those candidates vanish, and the
+  // page then reports a shorter address list than the agent actually published
+  // (the public srflx one was usually the casualty).
+  const early: SignalMessage[] = [];
   ws.addEventListener("message", (event) => {
     let msg: unknown;
     try {
@@ -40,6 +47,10 @@ export function makeSignalChannel(ws: WebSocket): SignalChannel {
     const m = msg as SignalMessage & { state?: string; type?: string };
     // The relay's "ready" frames are informational; ignore them here.
     if (m.type === "ready" || m.type === "waiting") return;
+    if (handlers.length === 0) {
+      early.push(m);
+      return;
+    }
     for (const h of handlers) h(m);
   });
   return {
@@ -48,6 +59,7 @@ export function makeSignalChannel(ws: WebSocket): SignalChannel {
     },
     onMessage: (h) => {
       handlers.push(h);
+      while (early.length > 0) h(early.shift() as SignalMessage);
     },
   };
 }

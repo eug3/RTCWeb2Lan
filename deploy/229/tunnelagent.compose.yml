@@ -17,7 +17,7 @@
 # commit prefix. See deploy/229/README.md for the build commands.
 services:
   tunnelagent:
-    image: rtcweb2lan/tunnelagent:20261101-f2850b5
+    image: rtcweb2lan/tunnelagent:20261101-quiet
     container_name: tunnelagent
     network_mode: host
     restart: unless-stopped

@@ -207,8 +207,11 @@ function stopWatchingLink(): void {
 
 async function tryConnect(): Promise<boolean> {
   failures.length = 0;
+  // Keep what earlier attempts saw: an address that only appeared on attempt 1
+  // is still something the agent publishes, and hiding it between attempts made
+  // the list look empty on a page that was in fact receiving candidates.
+  resetOffered();
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    resetOffered();
     attemptEl.textContent = "尝试 " + attempt + " / " + MAX_ATTEMPTS;
     try {
       const { peer } = await connectFlow({
