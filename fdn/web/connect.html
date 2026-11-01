@@ -92,6 +92,33 @@
         font-variant-numeric: tabular-nums; word-break: break-all;
       }
 
+      /* Every address the agent published. Deliberately small and dense: the
+         list is a diagnostic, not a headline — a page that cannot connect
+         should show at a glance whether a public srflx address was offered. */
+      .offered { margin-top: 7px; border-top: 1px dashed var(--line); padding-top: 5px; }
+      .off-head {
+        font-size: 10px; line-height: 1.2; color: var(--ink-faint);
+        letter-spacing: .3px; margin-bottom: 2px;
+      }
+      .off-list { display: flex; flex-direction: column; gap: 0; }
+      .off-row {
+        display: flex; align-items: baseline; gap: 6px;
+        font-size: 10.5px; line-height: 1.45;
+        font-variant-numeric: tabular-nums;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        color: var(--ink-soft, #445);
+      }
+      .off-row + .off-row { border-top: 1px solid rgba(0,0,0,.045); }
+      .off-type {
+        flex: 0 0 38px; font-size: 9.5px; letter-spacing: .2px;
+        color: var(--ink-faint); text-transform: lowercase;
+      }
+      .off-type[data-type="srflx"] { color: #b06f00; }
+      .off-type[data-type="host"] { color: #2f6f4f; }
+      .off-ep { flex: 1 1 auto; word-break: break-all; }
+      .off-win { flex: 0 0 auto; font-size: 9.5px; color: var(--accent); }
+      .off-row.win .off-ep { color: var(--accent); font-weight: 600; }
+
       /* ---- the welding monster (compact) ---- */
       .scene { width: 168px; height: auto; display: block; margin: 0 auto; }
 
@@ -241,6 +268,7 @@
           <span class="target-v" id="target">—</span>
         </div>
         <div id="link-detail"></div>
+        <div id="offered" class="offered" hidden></div>
       </div>
 
       <div id="failbox">

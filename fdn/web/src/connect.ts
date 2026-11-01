@@ -17,7 +17,7 @@ import {
 } from "./connect-flow.js";
 import { loadSiteConfig, pushConfigToServiceWorker } from "./config-loader.js";
 import { DEFAULT_SITE_CONFIG, DEFAULT_SIGNALING_PROFILE, type SignalingProfile } from "./config.js";
-import type { PeerConnectionHandle } from "./peer.js";
+import type { AdvertisedCandidate, PeerConnectionHandle } from "./peer.js";
 import { targetLabelFor } from "./router.js";
 
 const ASSET_BASE = (() => {
@@ -38,6 +38,7 @@ const attemptEl = el<HTMLDivElement>("attempt");
 const failBox = el<HTMLDivElement>("failbox");
 const reasonEl = el<HTMLDivElement>("reason");
 const targetEl = el<HTMLSpanElement>("target");
+const offeredEl = el<HTMLDivElement>("offered");
 const linkDetailEl = el<HTMLDivElement>("link-detail");
 
 const STAGE_TEXT: Record<string, string> = {
@@ -86,6 +87,62 @@ let targetLabel: string | null = targetLabelFor(location.hostname, DEFAULT_SITE_
 /** The tunnel we welded, kept so the page can report the pair that won. */
 let livePeer: PeerConnectionHandle | null = null;
 
+/**
+ * Every address the agent published for the attempt in flight (or the last one
+ * that failed), deduped by endpoint+type. Rendered as a dense list: it is the
+ * only place that shows whether a public srflx mapping was offered at all.
+ */
+let offered: AdvertisedCandidate[] = [];
+
+function renderOffered(winner?: string | null): void {
+  if (offered.length === 0) {
+    offeredEl.hidden = true;
+    offeredEl.textContent = "";
+    return;
+  }
+  offeredEl.hidden = false;
+  const frag = document.createDocumentFragment();
+  const head = document.createElement("div");
+  head.className = "off-head";
+  head.textContent = "公布地址 " + offered.length + " 个";
+  frag.append(head);
+  const list = document.createElement("div");
+  list.className = "off-list";
+  for (const c of offered) {
+    const row = document.createElement("div");
+    row.className = "off-row" + (winner && c.endpoint === winner ? " win" : "");
+    const t = document.createElement("span");
+    t.className = "off-type";
+    t.dataset.type = c.type;
+    t.textContent = c.type;
+    const a = document.createElement("span");
+    a.className = "off-ep";
+    a.textContent = c.endpoint;
+    row.append(t, a);
+    if (winner && c.endpoint === winner) {
+      const mark = document.createElement("span");
+      mark.className = "off-win";
+      mark.textContent = "选中";
+      row.append(mark);
+    }
+    list.append(row);
+  }
+  frag.append(list);
+  offeredEl.replaceChildren(frag);
+}
+
+function resetOffered(): void {
+  offered = [];
+  renderOffered();
+}
+
+function acceptCandidate(c: AdvertisedCandidate): void {
+  const key = c.endpoint + "|" + c.type;
+  if (offered.some((o) => o.endpoint + "|" + o.type === key)) return;
+  offered.push(c);
+  renderOffered();
+}
+
 function showTarget(): void {
   targetEl.textContent = targetLabel ?? "内网服务（按 Host 解析）";
 }
@@ -105,6 +162,7 @@ function showLink(/* display-only: never let this break the connect flow */): vo
       targetEl.textContent = d.ip;
       linkDetailEl.textContent = d.detail;
       targetEl.classList.toggle("done", pair !== null);
+      renderOffered(pair?.remote ?? null);
     })
     .catch(() => showTarget());
 }
@@ -150,6 +208,7 @@ function stopWatchingLink(): void {
 async function tryConnect(): Promise<boolean> {
   failures.length = 0;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    resetOffered();
     attemptEl.textContent = "尝试 " + attempt + " / " + MAX_ATTEMPTS;
     try {
       const { peer } = await connectFlow({
@@ -157,6 +216,7 @@ async function tryConnect(): Promise<boolean> {
         probePath,
         timeoutMs: CONNECT_TIMEOUT_MS,
         onStage: (s) => onStage(s, attempt),
+        onCandidate: acceptCandidate,
       });
       livePeer = peer;
       return true;
@@ -179,6 +239,7 @@ function showFailure(): void {
   // Still say where the link is heading — through nginx this time.
   showTarget();
   linkDetailEl.textContent = "此刻尚未打通，下面会经 nginx 反代进入";
+  renderOffered();
 }
 
 function finish(): void {

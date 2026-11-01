@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { describeLink } from "../src/connect-flow.js";
+import { connectAsInitiator, parseCandidate } from "../src/peer.js";
 import { targetLabelFor } from "../src/router.js";
 import type { SignalMessage } from "../src/signaling.js";
 import type { RouteRule } from "../src/config.js";
@@ -192,5 +193,77 @@ describe("targetLabelFor", () => {
   it("has no label for a host served only by prefix rules", () => {
     expect(targetLabelFor("portal.example.com", rules)).toBeNull();
     expect(targetLabelFor("unknown.example.com", rules)).toBeNull();
+  });
+});
+
+describe("advertised candidates", () => {
+  const offerSdp = [
+    "v=0",
+    "a=candidate:1 1 udp 2130706431 10.1.1.229 37123 typ host generation 0",
+    "a=candidate:2 1 udp 2130706431 192.168.1.229 39021 typ host generation 0",
+    "a=candidate:3 1 udp 1694498815 180.110.180.196 38281 typ srflx raddr 10.1.1.229 rport 37123 generation 0",
+    "a=end-of-candidates",
+  ].join("\n");
+
+  function handleWith(sdp: string, trickle: string[] = []) {
+    const pc = {
+      connectionState: "connected",
+      addEventListener: () => {},
+      createDataChannel: () => ({}),
+      createOffer: async () => ({ type: "offer", sdp: "v=0" }),
+      setLocalDescription: async () => {},
+      setRemoteDescription: async () => {},
+      addIceCandidate: async () => {},
+      localDescription: { sdp: "v=0" },
+      getStats: async () => report([]),
+      close: () => {},
+    };
+    const signaling = {
+      send: () => {},
+      onMessage: (handler: (m: SignalMessage) => void) => {
+        queueMicrotask(() => {
+          handler({ v: 1, type: "answer", session: "s", sdp });
+          for (const c of trickle) handler({ v: 1, type: "candidate", session: "s", candidate: c, sdpMid: null, sdpMLineIndex: 0 });
+        });
+      },
+    };
+    return connectAsInitiator({
+      session: "s",
+      signaling,
+      config: { iceServers: [] },
+      deps: { createPeerConnection: () => pc as unknown as RTCPeerConnection },
+    });
+  }
+
+  it("parses an ICE candidate line into type, protocol and endpoint", () => {
+    expect(parseCandidate("a=candidate:3 1 udp 1694498815 180.110.180.196 38281 typ srflx raddr 10.1.1.229 rport 37123")).toEqual({
+      type: "srflx",
+      protocol: "udp",
+      address: "180.110.180.196",
+      port: 38281,
+      endpoint: "180.110.180.196:38281",
+    });
+    expect(parseCandidate("candidate:1 1 udp 2130706431 10.1.1.229 37123 typ host")?.endpoint).toBe("10.1.1.229:37123");
+    expect(parseCandidate("not a candidate")).toBeNull();
+  });
+
+  it("reports every address the agent published, including srflx", async () => {
+    const handle = await handleWith(offerSdp);
+    expect(handle.advertisedCandidates().map((c) => c.endpoint)).toEqual([
+      "10.1.1.229:37123",
+      "192.168.1.229:39021",
+      "180.110.180.196:38281",
+    ]);
+    expect(handle.advertisedCandidates().map((c) => c.type)).toEqual(["host", "host", "srflx"]);
+  });
+
+  it("does not duplicate a trickled candidate that was already in the answer", async () => {
+    const handle = await handleWith(offerSdp, [
+      "candidate:1 1 udp 2130706431 10.1.1.229 37123 typ host",
+      "candidate:9 1 udp 1 203.0.113.9 5000 typ relay",
+    ]);
+    const list = handle.advertisedCandidates();
+    expect(list).toHaveLength(4);
+    expect(list.at(-1)?.type).toBe("relay");
   });
 });

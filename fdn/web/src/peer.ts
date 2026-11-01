@@ -27,6 +27,46 @@ export interface SignalChannel {
   onMessage(handler: (msg: SignalMessage) => void): void;
 }
 
+/** One address the agent published to this page, i.e. a candidate to try. */
+export interface AdvertisedCandidate {
+  /** "host" | "srflx" | "prflx" | "relay". */
+  type: string;
+  /** Transport, normally "udp"; TCP candidates are rare but possible. */
+  protocol: string;
+  /** Address as advertised: an IP, or an mDNS name such as "9f2a….local". */
+  address: string;
+  port: number;
+  /** "ip:port" for display, IPv6 bracketed. */
+  endpoint: string;
+}
+
+/**
+ * Parse one ICE candidate line, in either form the page sees it:
+ * "a=candidate:…" from the answer SDP, or "candidate:…" from trickle.
+ *
+ * Layout: foundation component protocol priority address port typ type …
+ * Returns null for anything that does not look like a candidate.
+ */
+export function parseCandidate(line: string): AdvertisedCandidate | null {
+  const text = line.trim().replace(/^a=/, "");
+  if (!text.startsWith("candidate:")) return null;
+  const f = text.split(/\s+/);
+  if (f.length < 8) return null;
+  const protocol = f[2] ?? "udp";
+  const address = f[4];
+  const port = Number(f[5]);
+  const typAt = f.indexOf("typ");
+  const type = typAt >= 0 ? (f[typAt + 1] ?? "") : "";
+  if (!address || !Number.isFinite(port) || !type) return null;
+  return {
+    type,
+    protocol,
+    address,
+    port,
+    endpoint: address.includes(":") ? `[${address}]:${port}` : `${address}:${port}`,
+  };
+}
+
 /** The candidate pair connectivity checks actually agreed on. */
 export interface SelectedPair {
   /** Browser-side address of the pair ("ip:port"). */
@@ -54,6 +94,14 @@ export interface PeerConnectionHandle {
    * rejections: this is display-only and must never affect the connection.
    */
   selectedPair(): Promise<SelectedPair | null>;
+  /**
+   * Every address the agent published, in the order it appeared.
+   *
+   * This is the page's view of "where can I reach the agent": the EasyTier
+   * host address, the LAN one, and the public srflx mapping STUN discovered.
+   * Empty before the answer arrives.
+   */
+  advertisedCandidates(): AdvertisedCandidate[];
   close(): void;
 }
 
@@ -102,14 +150,31 @@ export async function connectAsInitiator(opts: {
   signaling: SignalChannel;
   config: PeerConfig;
   deps: PeerDeps;
+  /** Called once per newly advertised address, for live display. */
+  onCandidate?: (c: AdvertisedCandidate) => void;
 }): Promise<PeerConnectionHandle> {
-  const { session, signaling, config, deps } = opts;
+  const { session, signaling, config, deps, onCandidate } = opts;
   const ctor = deps.createPeerConnection ?? ((c: RTCConfiguration) => new RTCPeerConnection(c));
   const pc = ctor({ iceServers: config.iceServers as RTCIceServer[] });
 
   let localType: string | null = null;
   let remoteType: string | null = null;
   let primaryChannel: RTCDataChannel | null = null;
+
+  // Addresses the agent published, deduped. The page shows them while it waits
+  // and after it connects, so "which addresses were even offered?" is never a
+  // guess.
+  const published: AdvertisedCandidate[] = [];
+  const seen = new Set<string>();
+  const publish = (line: string) => {
+    const c = parseCandidate(line);
+    if (!c) return;
+    const key = `${c.protocol}|${c.address}|${c.port}|${c.type}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    published.push(c);
+    onCandidate?.(c);
+  };
 
   pc.addEventListener("icecandidate", (event) => {
     if (!event.candidate) return;
@@ -129,8 +194,14 @@ export async function connectAsInitiator(opts: {
     signaling.onMessage((msg) => {
       if (msg.session !== session) return;
       if (msg.type === "answer") {
+        // pion embeds every candidate it gathered into the answer, so this is
+        // the authoritative list — trickle below only adds latecomers.
+        for (const line of msg.sdp.split("\n")) {
+          if (line.startsWith("a=candidate:")) publish(line);
+        }
         pc.setRemoteDescription({ type: "answer", sdp: msg.sdp }).then(resolve, reject);
       } else if (msg.type === "candidate") {
+        publish(msg.candidate);
         const t = candidateType(msg.candidate);
         if (t !== null && remoteType === null) remoteType = t;
         void pc
@@ -166,7 +237,7 @@ export async function connectAsInitiator(opts: {
   // never delivers, agent-side the channel opens but no bytes arrive). Every
   // request opens a fresh channel on the established connection instead.
   primaryChannel = null;
-  return makeHandle(pc, () => localType, () => remoteType, session, signaling);
+  return makeHandle(pc, () => localType, () => remoteType, session, signaling, () => null, published);
 }
 
 /**
@@ -237,6 +308,7 @@ function makeHandle(
   session: string,
   signaling: SignalChannel,
   takePrimary: () => RTCDataChannel | null = () => null,
+  published: AdvertisedCandidate[] = [],
 ): PeerConnectionHandle {
   return {
     openChannel: () => {
@@ -256,6 +328,7 @@ function makeHandle(
       return localType() === "relay" || remoteType() === "relay";
     },
     selectedPair: () => readSelectedPair(pc),
+    advertisedCandidates: () => published.slice(),
     close() {
       signaling.send({ v: SIGNAL_PROTOCOL_VERSION, type: "bye", session });
       pc.close();

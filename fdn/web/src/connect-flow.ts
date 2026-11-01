@@ -10,7 +10,13 @@
 
 import { attachDataPlane, instanceFromPeer, runExchange } from "./data-plane.js";
 import { encodeRequest, parseResponse } from "./http1.js";
-import { connectAsInitiator, type PeerConnectionHandle, type SelectedPair, type SignalChannel } from "./peer.js";
+import {
+  connectAsInitiator,
+  type AdvertisedCandidate,
+  type PeerConnectionHandle,
+  type SelectedPair,
+  type SignalChannel,
+} from "./peer.js";
 import type { SignalMessage } from "./signaling.js";
 
 /** One HTTP exchange straight over the peer connection, bypassing the SW. */
@@ -259,6 +265,12 @@ export interface ConnectFlowOptions {
   timeoutMs?: number;
   probePath?: string;
   onStage?: (s: ConnectStage) => void;
+  /**
+   * Fires as the agent publishes each address (host, LAN, srflx). Display only:
+   * the page lists what was offered so a failed attempt says which addresses
+   * were even reachable.
+   */
+  onCandidate?: (c: AdvertisedCandidate) => void;
 }
 
 export interface ConnectFlowResult {
@@ -353,6 +365,7 @@ export async function connectFlow(options: ConnectFlowOptions): Promise<ConnectF
         signaling: makeSignalChannel(ws),
         config: { iceServers, connectTimeoutMs: timeoutMs },
         deps: {},
+        onCandidate: options.onCandidate,
       }),
       timeoutMs + 2000,
       "WebRTC 连接",
