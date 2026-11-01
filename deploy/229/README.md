@@ -26,10 +26,16 @@ that tag is the rollback point.
 
 ## Run / replace
 
+`docker compose` is not installed on 229, so use the script (the executable
+form of the compose file — keep the two in sync):
+
 ```bash
 cd deploy/229
-sudo docker compose -f tunnelagent.compose.yml up -d
+sudo bash run.sh
 ```
+
+If compose is ever installed there, `docker compose -f tunnelagent.compose.yml
+up -d` produces the same container.
 
 Replacing the image keeps the same container name and restarts it; every live
 P2P session drops for a few seconds and browsers re-pair.
