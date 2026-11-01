@@ -13,7 +13,9 @@ set -euo pipefail
 IMAGE=${IMAGE:-rtcweb2lan/tunnelagent:20261101-f2850b5}
 ROUTES=${ROUTES:-/home/beijihu/web2lan/routes.yaml}
 
-# The systemd unit is the rollback path; running both doubles the slot count.
+# A systemd unit must not coexist with this container: both would hold a full
+# pool of slots (the 2026-11-01 outage). The unit was deleted from the host; the
+# guard stays so re-creating one cannot silently double the pool.
 if systemctl is-active --quiet web2lan-agent 2>/dev/null; then
   echo "web2lan-agent is still running; stop it first:" >&2
   echo "  sudo systemctl disable --now web2lan-agent" >&2

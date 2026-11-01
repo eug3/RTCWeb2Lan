@@ -2,10 +2,11 @@
 #
 # 229 must run exactly one agent. Two (this container plus a systemd unit, or
 # two containers) put 64 slots in the room, half of them on stale code, and the
-# relay then hands browsers to whichever answers first. The systemd unit
-# `web2lan-agent` must stay disabled:
+# relay then hands browsers to whichever answers first.
 #
-#   sudo systemctl disable --now web2lan-agent
+# The systemd unit `web2lan-agent` was removed on 2026-11-01 together with its
+# binaries under /home/beijihu/web2lan (see README). This container is the only
+# deployment now; do not re-create a unit alongside it.
 #
 # network_mode: host is required, not a convenience: the agent's ICE candidates
 # are the host's own interfaces (10.1.1.229 over EasyTier, 192.168.1.229 on the

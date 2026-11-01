@@ -1,9 +1,17 @@
 # 229 — tunnelagent (the only agent in room `lan`)
 
 The agent holds a pool of signaling slots; the relay binds one per browser.
-Everything P2P goes through it, so it must be the single instance: the
-systemd unit `web2lan-agent` is kept as a rollback path only and MUST stay
-disabled while the container runs.
+Everything P2P goes through it, so it must be the single instance.
+
+**History:** until 2026-11-01 this host ran the agent as a systemd unit
+(`web2lan-agent`) with the binary in `/home/beijihu/web2lan`. A container was
+added on 2026-10-30 and both kept running, which put 64 slots in the room and
+caused the 2026-11-01 outage (relay paired browsers with dead connections).
+The unit and its binaries were removed; only `routes.yaml` and the logs remain
+in that directory, because the container mounts `routes.yaml`.
+
+Rollback is now an image tag swap (the previous tag stays on the host), not a
+systemd unit.
 
 ## Build the image (from this repo)
 
