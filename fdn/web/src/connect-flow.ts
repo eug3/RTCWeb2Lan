@@ -379,6 +379,25 @@ export async function connectFlow(options: ConnectFlowOptions): Promise<ConnectF
     throw error;
   }
 
+  // Signaling is over: release the agent on the relay and drop the socket.
+  //
+  // The agent is bound to this socket until it closes, and the socket used to
+  // live as long as the tab — so every open tab (and every reconnect) held one
+  // of the 32 slots. The tunnel is already verified above; nothing else travels
+  // over this socket.
+  const detach = () => {
+    try {
+      ws.send(JSON.stringify({ v: 1, type: "detach", session: "" }));
+    } catch {
+      // Socket already gone; the relay cleans up on close either way.
+    }
+    try {
+      ws.close();
+    } catch {
+      // ditto
+    }
+  };
+
   onStage({ stage: "attaching" });
   try {
     // Verify the tunnel BEFORE handing it to the Service Worker.
@@ -402,6 +421,7 @@ export async function connectFlow(options: ConnectFlowOptions): Promise<ConnectF
 
     await attachPortToServiceWorker(peer);
     await setOverlayEnabled(true);
+    detach();
   } catch (error) {
     abandon();
     await setOverlayEnabled(false).catch(() => {});

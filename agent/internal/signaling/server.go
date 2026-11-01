@@ -6,6 +6,7 @@
 package signaling
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"sync"
@@ -139,6 +140,32 @@ func (r *Room) ensureBound(p *Peer) *Peer {
 		}
 	}
 	return agent
+}
+
+// detach releases a browser's agent once the tunnel no longer needs signaling.
+//
+// The binding exists so an offer can reach an agent and candidates can flow the
+// other way. Once the page has a verified DataChannel none of that is needed,
+// yet the socket used to stay open (and kept its agent) for the life of the
+// tab: a few tabs and reconnects filled the pool for everyone else. Detaching
+// is not "bye" — the agent keeps its live peer; only the relay's bookkeeping
+// goes away.
+func (r *Room) detach(p *Peer) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i, w := range r.waiting {
+		if w == p {
+			r.waiting = append(r.waiting[:i], r.waiting[i+1:]...)
+			break
+		}
+	}
+	agent, ok := r.bound[p]
+	if !ok {
+		return
+	}
+	delete(r.bound, p)
+	r.idle = append(r.idle, agent)
+	_ = agent.Write([]byte(`{"v":1,"type":"ready","state":"waiting"}`))
 }
 
 // counterpart returns the peer the given one talks to.
@@ -365,6 +392,18 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
 			return
+		}
+
+		// A page that has finished signaling says so and closes the socket; the
+		// agent slot must go back to the pool, not wait for the tab to die.
+		if peer.role == "browser" {
+			var head struct {
+				Type string `json:"type"`
+			}
+			if json.Unmarshal(data, &head) == nil && head.Type == "detach" {
+				room.detach(peer)
+				continue
+			}
 		}
 
 		var other *Peer
