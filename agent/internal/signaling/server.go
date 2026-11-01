@@ -57,6 +57,11 @@ func (p *Peer) probe() error {
 }
 
 const (
+	// silentBrowserTTL is how long a browser socket may sit without sending a
+	// frame before the relay closes it. Such a socket holds no agent slot
+	// (binding is lazy) but it does hold a goroutine and an fd.
+	silentBrowserTTL = 20 * time.Second
+
 	// writeTimeout bounds a single write so a dead peer cannot hold the lock
 	// (and therefore the room) indefinitely.
 	writeTimeout = 10 * time.Second
@@ -140,6 +145,15 @@ func (r *Room) ensureBound(p *Peer) *Peer {
 		}
 	}
 	return agent
+}
+
+// stats reports the pool split, for the join log line. A saturated pool looks
+// identical to an empty one from the outside ("everyone waits"), so the counts
+// are the only way to tell "all agents busy" from "all agents lost".
+func (r *Room) stats() (idle, waiting, bound int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.idle), len(r.waiting), len(r.bound)
 }
 
 // detach releases a browser's agent once the tunnel no longer needs signaling.
@@ -350,6 +364,27 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	room := s.getRoom(roomID)
 
+	// A browser that joins and never says anything is a stuck client: its
+	// WebSocket handshake completed on our side but its page never got far
+	// enough to offer (a proxy that lost the 101, a sleeping laptop, a
+	// headless run). Such sockets cost nothing in agent slots — binding is
+	// lazy — but they pile up in the waiting list and in the fd table, so
+	// they are reaped instead of being kept forever.
+	if role == "browser" {
+		go func() {
+			timer := time.NewTimer(silentBrowserTTL)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				if !peer.active.Load() {
+					s.log.Printf("room %s: browser silent for %s; closing", roomID, silentBrowserTTL)
+					_ = conn.Close()
+				}
+			case <-done:
+			}
+		}()
+	}
+
 	var paired bool
 	if role == "agent" {
 		paired = room.addAgent(peer) != nil
@@ -357,7 +392,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		// Queue only; the agent is chosen when this browser speaks.
 		room.addBrowser(peer)
 	}
-	s.log.Printf("room %s: %s joined (paired=%v)", roomID, role, paired)
+	idle, waiting, bound := room.stats()
+	s.log.Printf("room %s: %s joined (paired=%v; idle=%d waiting=%d bound=%d)", roomID, role, paired, idle, waiting, bound)
 
 	// frames hands a payload to the writer without blocking the room.
 	frames := func(b []byte) {
