@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -19,6 +20,12 @@ type Peer struct {
 	conn *websocket.Conn
 	role string
 	mu   sync.Mutex
+	// active is set once a browser sends its first frame. A page opens its
+	// signaling socket before it has anything to say (and the holder re-opens
+	// one every few seconds while it decides), so "connected" is not the same
+	// as "wants a tunnel". Binding on connect burned the whole agent pool on
+	// sockets that never sent a byte.
+	active atomic.Bool
 }
 
 // Write sends a message to this peer.
@@ -87,29 +94,51 @@ func newRoom() *Room {
 func (r *Room) addAgent(p *Peer) (browser *Peer) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(r.waiting) > 0 {
-		browser = r.waiting[0]
-		r.waiting = r.waiting[1:]
-		r.bound[browser] = p
-		return browser
+	for i, w := range r.waiting {
+		if !w.active.Load() {
+			continue
+		}
+		r.waiting = append(r.waiting[:i], r.waiting[i+1:]...)
+		r.bound[w] = p
+		return w
 	}
 	r.idle = append(r.idle, p)
 	return nil
 }
 
-// addBrowser registers a browser, returning the agent connection bound to it
-// (nil when none is free yet).
-func (r *Room) addBrowser(p *Peer) (agent *Peer) {
+// addBrowser queues a browser. It is NOT bound here: see ensureBound.
+func (r *Room) addBrowser(p *Peer) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(r.idle) > 0 {
-		agent = r.idle[0]
-		r.idle = r.idle[1:]
-		r.bound[p] = agent
+	r.waiting = append(r.waiting, p)
+}
+
+// ensureBound binds a browser to an idle agent the first time it speaks, and
+// returns the agent it talks to (nil while it must wait).
+//
+// Binding at connect time was the pool leak: every socket a page opened — and
+// the holder opens one every few seconds while it decides — took an agent slot
+// for the life of that socket, whether or not it ever sent an offer. The pool
+// drained, and the next real visitor was told "waiting" until it timed out.
+func (r *Room) ensureBound(p *Peer) *Peer {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if agent, ok := r.bound[p]; ok {
 		return agent
 	}
-	r.waiting = append(r.waiting, p)
-	return nil
+	if len(r.idle) == 0 {
+		return nil
+	}
+	agent := r.idle[0]
+	r.idle = r.idle[1:]
+	r.bound[p] = agent
+	for i, w := range r.waiting {
+		if w == p {
+			r.waiting = append(r.waiting[:i], r.waiting[i+1:]...)
+			break
+		}
+	}
+	return agent
 }
 
 // counterpart returns the peer the given one talks to.
@@ -298,7 +327,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	if role == "agent" {
 		paired = room.addAgent(peer) != nil
 	} else {
-		paired = room.addBrowser(peer) != nil
+		// Queue only; the agent is chosen when this browser speaks.
+		room.addBrowser(peer)
 	}
 	s.log.Printf("room %s: %s joined (paired=%v)", roomID, role, paired)
 
@@ -337,7 +367,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		other := room.counterpart(peer)
+		var other *Peer
+		if peer.role == "browser" {
+			peer.active.Store(true)
+			other = room.ensureBound(peer)
+		} else {
+			other = room.counterpart(peer)
+		}
 		if other == nil {
 			// Nobody bound yet; tell the sender to wait.
 			frames([]byte(`{"v":1,"type":"waiting"}`))

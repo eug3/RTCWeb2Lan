@@ -301,6 +301,26 @@ export async function connectFlow(options: ConnectFlowOptions): Promise<ConnectF
 
   const ws = new WebSocket(url.toString());
 
+  /**
+   * Hand the slot back when this attempt fails.
+   *
+   * The relay binds one agent connection to this browser socket for the life
+   * of that socket, so a socket left open after a failed attempt keeps an agent
+   * slot hostage — and the page's own retries (plus several tabs, plus the
+   * holder) exhaust the pool. It was the pool disappearing that made every
+   * later visitor see "answer timed out".
+   *
+   * The browser answered pings at the transport level even after the page lost
+   * interest, so the relay never saw it die.
+   */
+  const abandon = () => {
+    try {
+      ws.close();
+    } catch {
+      // Already closing; nothing to release.
+    }
+  };
+
   let peer: PeerConnectionHandle;
   try {
     await withDeadline(
@@ -339,6 +359,7 @@ export async function connectFlow(options: ConnectFlowOptions): Promise<ConnectF
     );
   } catch (error) {
     // Fall back: keep the SW out of the way so the origin (nginx) serves us.
+    abandon();
     await setOverlayEnabled(false).catch(() => {});
     const reason = error instanceof Error ? error.message : String(error);
     onStage({ stage: "failed", reason });
@@ -362,12 +383,14 @@ export async function connectFlow(options: ConnectFlowOptions): Promise<ConnectF
     const reachable = await probePeer(peer, options.probePath, options.timeoutMs);
     if (!reachable) {
       peer.close();
+      abandon();
       throw new Error("隧道探测失败");
     }
 
     await attachPortToServiceWorker(peer);
     await setOverlayEnabled(true);
   } catch (error) {
+    abandon();
     await setOverlayEnabled(false).catch(() => {});
     const reason = error instanceof Error ? error.message : String(error);
     onStage({ stage: "failed", reason });

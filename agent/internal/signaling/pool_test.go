@@ -158,6 +158,7 @@ func TestBrowserWaitsThenBinds(t *testing.T) {
 	send(t, browser, "late-offer")
 	expect(t, agent, "late-offer", "offer forwarded to late agent")
 }
+
 // A room must not be forgotten while it still holds agent connections. The old
 // code decided emptiness from a count taken before the lock was re-acquired, so
 // a peer joining in that window ended up in a room the map had already dropped
@@ -196,6 +197,7 @@ func TestRoomSurvivesWhileAgentsRemain(t *testing.T) {
 	}
 	t.Fatal("neither surviving agent served the new browser; the room was dropped")
 }
+
 // A connection must survive past the read deadline as long as the relay keeps
 // pinging. The bug this guards against: the client installed only a PongHandler,
 // but the relay sends Pings, so the client's own deadline was never refreshed
@@ -327,4 +329,39 @@ func TestDeadWaitingBrowserDoesNotHogTheAgent(t *testing.T) {
 	// And the answer comes back the same way.
 	send(t, agent, "answer-live")
 	expect(t, live, "answer-live", "answer delivered to the live browser")
+}
+
+// A browser socket that never asks for anything must not hold an agent slot.
+//
+// The holder iframe re-opens a signaling socket every few seconds while it
+// decides whether to connect; each one used to be bound to an idle agent at
+// connect time and kept it for the life of the socket. The pool drained within
+// a few minutes and every later visitor was told to wait until it timed out.
+func TestSilentBrowserDoesNotHoldAnAgentSlot(t *testing.T) {
+	logger := log.New(os.Stderr, "[relay-test] ", log.LstdFlags)
+	srv := httptest.NewServer(signaling.NewServer(logger).Handler())
+	defer srv.Close()
+
+	agent := dial(t, srv.URL, "silent", "agent")
+	defer func() { _ = agent.Close() }()
+
+	// Ten sockets that connect and say nothing — what the holder does.
+	var silent []*websocket.Conn
+	for i := 0; i < 10; i++ {
+		silent = append(silent, dial(t, srv.URL, "silent", "browser"))
+	}
+	defer func() {
+		for _, c := range silent {
+			_ = c.Close()
+		}
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	// A real visitor must still find the (single) agent free.
+	live := dial(t, srv.URL, "silent", "browser")
+	defer func() { _ = live.Close() }()
+	send(t, live, "real-offer")
+	expect(t, agent, "real-offer", "the real browser's offer reached the agent")
+	send(t, agent, "real-answer")
+	expect(t, live, "real-answer", "the answer reached the real browser")
 }
