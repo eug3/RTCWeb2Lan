@@ -68,6 +68,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Hand each withdrawn agent slot back to its owner. Without this, a slot
+	// killed by the relay (a browser gone mid-frame, a half-dead socket) is
+	// simply lost: the agent only re-dials when told, so its pool shrinks one
+	// visitor at a time until no browser can be paired at all.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case room := <-srv.Slots():
+				logger.Printf("agent slot withdrawn in room %q; asking the agent to redial", room)
+			}
+		}
+	}()
+
 	go func() {
 		logger.Printf("listening on %s (overlay assets at %s/, signaling at %s/ws)", *addr, *prefix, *prefix)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

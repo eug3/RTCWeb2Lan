@@ -69,6 +69,11 @@ func New(opts Options) *Server {
 // Handler returns the composed http.Handler.
 func (s *Server) Handler() http.Handler { return s.handler }
 
+// Slots reports rooms whose agent connection was withdrawn. A caller that
+// forwards this to the agent lets it redial the lost slot; see
+// signaling.Server.Slots.
+func (s *Server) Slots() <-chan string { return s.signal.Slots() }
+
 func (s *Server) build() http.Handler {
 	mux := http.NewServeMux()
 

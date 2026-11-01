@@ -25,8 +25,36 @@ type Peer struct {
 func (p *Peer) Write(b []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// A write without a deadline blocks forever on a half-dead TCP connection,
+	// and every caller holds the peer lock while it does. Nothing can then be
+	// forwarded to this peer, and the room cannot free the slot either.
+	_ = p.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	return p.conn.WriteMessage(websocket.TextMessage, b)
 }
+
+// probe flushes the connection so dead peers surface as an error.
+//
+// A control frame proves nothing on its own: gorilla reports a successful write
+// once the bytes are buffered, even when the socket has been reset. This is why
+// peer death used to go unnoticed and room slots piled up (agents left=33). The
+// flush is what turns "the far end is gone" into an error we can act on.
+func (p *Peer) probe() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_ = p.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	if err := p.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+		return err
+	}
+	return p.conn.UnderlyingConn().SetWriteDeadline(time.Now().Add(writeTimeout))
+}
+
+const (
+	// writeTimeout bounds a single write so a dead peer cannot hold the lock
+	// (and therefore the room) indefinitely.
+	writeTimeout = 10 * time.Second
+	// livenessCheckEvery is how often an idle connection is proven alive.
+	livenessCheckEvery = 20 * time.Second
+)
 
 // Room pairs browsers with agent connections.
 //
@@ -99,9 +127,14 @@ func (r *Room) counterpart(p *Peer) *Peer {
 	return r.bound[p]
 }
 
-// remove drops a peer and its binding, returning how many agent connections the
-// room still has (which tells the agent whether it must dial again).
-func (r *Room) remove(p *Peer) (agentsLeft int) {
+// remove drops a peer and its binding.
+//
+// A dying agent connection must not inherit a waiting browser: the agent is
+// about to close its socket and would leave that browser waiting again, so the
+// browser goes back to the head of the queue and the agent slot is handed back
+// to its owner via freeAgent. agentsLeft reports how many agent connections the
+// room still holds (informational, for the log line).
+func (r *Room) remove(p *Peer) (agentsLeft int, freeAgent bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -109,47 +142,53 @@ func (r *Room) remove(p *Peer) (agentsLeft int) {
 		for i, idle := range r.idle {
 			if idle == p {
 				r.idle = append(r.idle[:i], r.idle[i+1:]...)
-				return len(r.idle) + len(r.bound)
+				return len(r.idle) + len(r.bound), true
 			}
 		}
 		for browser, agent := range r.bound {
 			if agent == p {
 				delete(r.bound, browser)
-				r.waiting = append(r.waiting, browser)
+				// Back to the front of the queue: it was waiting longest.
+				r.waiting = append([]*Peer{browser}, r.waiting...)
 				break
 			}
 		}
-	} else {
-		var pairedAgent *Peer
-		for browser, agent := range r.bound {
-			if browser == p {
-				pairedAgent = agent
-				delete(r.bound, browser)
-				break
-			}
+		return len(r.idle) + len(r.bound), true
+	}
+
+	// A browser left. The waiting list is scanned first: a browser that was
+	// queued before it bonded is no longer a live peer, and handing it to an
+	// idle agent strands a real visitor behind a dead one. (That was the 2026-11
+	// outage: every browser for 45 minutes was rejected with "write tcp ...
+	// i/o timeout", then "answer timed out" in the page.)
+	for i, w := range r.waiting {
+		if w == p {
+			r.waiting = append(r.waiting[:i], r.waiting[i+1:]...)
+			return len(r.idle) + len(r.bound), false
 		}
-		for i, w := range r.waiting {
-			if w == p {
-				r.waiting = append(r.waiting[:i], r.waiting[i+1:]...)
-				break
-			}
-		}
-		if pairedAgent != nil {
-			// Notify the paired agent that its browser departed so it can tear down the session.
-			_ = pairedAgent.Write([]byte(`{"v":1,"type":"bye"}`))
+	}
+	for browser, agent := range r.bound {
+		if browser == p {
+			delete(r.bound, browser)
+			// Notify the paired agent that its browser departed so it can tear
+			// down the session. Its slot then returns to waiting (idle) or is
+			// handed to the next queued browser. Both writes are best-effort:
+			// a dead agent must not break the relay for everyone else.
+			_ = agent.Write([]byte(`{"v":1,"type":"bye"}`))
 			if len(r.waiting) > 0 {
 				nextBrowser := r.waiting[0]
 				r.waiting = r.waiting[1:]
-				r.bound[nextBrowser] = pairedAgent
-				_ = pairedAgent.Write([]byte(`{"v":1,"type":"ready","state":"paired"}`))
+				r.bound[nextBrowser] = agent
+				_ = agent.Write([]byte(`{"v":1,"type":"ready","state":"paired"}`))
 				_ = nextBrowser.Write([]byte(`{"v":1,"type":"ready","state":"paired"}`))
 			} else {
-				r.idle = append(r.idle, pairedAgent)
-				_ = pairedAgent.Write([]byte(`{"v":1,"type":"ready","state":"waiting"}`))
+				r.idle = append(r.idle, agent)
+				_ = agent.Write([]byte(`{"v":1,"type":"ready","state":"waiting"}`))
 			}
+			break
 		}
 	}
-	return len(r.idle) + len(r.bound)
+	return len(r.idle) + len(r.bound), false
 }
 
 // Server is the relay.
@@ -159,6 +198,9 @@ type Server struct {
 
 	mu    sync.Mutex
 	rooms map[string]*Room
+	// slots carries rooms that lost an agent connection, so the agent can dial
+	// a replacement slot. See releaseSlot.
+	slots chan string
 }
 
 // NewServer creates a relay server.
@@ -173,6 +215,7 @@ func NewServer(logger *log.Logger) *Server {
 			CheckOrigin: func(*http.Request) bool { return true },
 		},
 		rooms: make(map[string]*Room),
+		slots: make(chan string, 64),
 	}
 }
 
@@ -229,12 +272,20 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	peer := &Peer{conn: conn, role: role}
 
+	// out serialises this connection's writes. The read loop must never write
+	// directly: a browser dying mid-frame used to block it for the full TCP
+	// timeout, and nothing else could ever be delivered to that browser.
+	out := make(chan []byte, outQueue)
+	outDone := make(chan struct{})
+	go writeLoop(peer, out, outDone)
+
 	// Keep the connection warm and notice when the far end dies. A pong is
 	// answered automatically by the gorilla read loop; the deadline below is
 	// what turns "no pong" into an actual read error.
 	done := make(chan struct{})
 	defer close(done)
-	go keepalive(conn, done)
+	defer close(outDone)
+	go keepalive(conn, done, peer.probe)
 	const pongWait = 75 * time.Second
 	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 	conn.SetPongHandler(func(string) error {
@@ -251,19 +302,33 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log.Printf("room %s: %s joined (paired=%v)", roomID, role, paired)
 
+	// frames hands a payload to the writer without blocking the room.
+	frames := func(b []byte) {
+		select {
+		case out <- b:
+		default:
+			// A peer this far behind is gone in every sense that matters.
+			s.log.Printf("room %s: %s send buffer full; dropping peer", roomID, role)
+			_ = conn.Close()
+		}
+	}
+
 	defer func() {
-		left := room.remove(peer)
-		s.log.Printf("room %s: %s left (agents left=%d)", roomID, role, left)
+		agentsLeft, freeAgent := room.remove(peer)
+		s.log.Printf("room %s: %s left (agents left=%d)", roomID, role, agentsLeft)
 		s.dropIfEmpty(roomID, room)
 		_ = conn.Close()
+		if freeAgent {
+			s.releaseSlot(roomID)
+		}
 	}()
 
 	// Ready frames are informational — the browser ignores them and offers on
 	// its own timer — but they keep the protocol honest for other clients.
 	if paired {
-		_ = peer.Write([]byte(`{"v":1,"type":"ready","state":"paired"}`))
+		frames([]byte(`{"v":1,"type":"ready","state":"paired"}`))
 	} else {
-		_ = peer.Write([]byte(`{"v":1,"type":"ready","state":"waiting"}`))
+		frames([]byte(`{"v":1,"type":"ready","state":"waiting"}`))
 	}
 
 	for {
@@ -275,15 +340,58 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		other := room.counterpart(peer)
 		if other == nil {
 			// Nobody bound yet; tell the sender to wait.
-			_ = peer.Write([]byte(`{"v":1,"type":"waiting"}`))
+			frames([]byte(`{"v":1,"type":"waiting"}`))
 			continue
 		}
 		if err := other.Write(data); err != nil {
+			// The far end is gone. Drop OUR connection too: our defer then frees
+			// the slot, and the agent (which asked for it) dials a fresh one.
+			// Returning here without closing left the room holding a corpse
+			// whose socket stayed open until the process restarted.
 			s.log.Printf("room %s: relay to %s failed: %v", roomID, other.role, err)
+			_ = conn.Close()
 			return
 		}
 	}
 }
+
+// outQueue bounds how far a peer may lag before it is considered gone.
+const outQueue = 64
+
+// writeLoop is the only writer for a peer after its status frame.
+func writeLoop(p *Peer, out <-chan []byte, done <-chan struct{}) {
+	for {
+		select {
+		case <-done:
+			return
+		case b := <-out:
+			if err := p.Write(b); err != nil {
+				// Dropping the socket wakes the reader, whose defer cleans up.
+				_ = p.conn.Close()
+				return
+			}
+		}
+	}
+}
+
+// releaseSlot asks the room's agent to dial one more connection.
+//
+// The agent holds a fixed number of signaling slots and only re-dials when it
+// hears this frame; every other path leaves it in a state where it must never
+// dial (a live connection would be dropped by the relay as a duplicate). So a
+// slot that dies here is reported exactly once.
+func (s *Server) releaseSlot(roomID string) {
+	select {
+	case s.slots <- roomID:
+	default:
+		// The buffer only exists so a departing peer never blocks; a full one
+		// means an agent is not reading, and it re-dials on its own timer.
+		_ = roomID
+	}
+}
+
+// Slots reports which rooms have asked for a replacement agent connection.
+func (s *Server) Slots() <-chan string { return s.slots }
 
 func (s *Server) getRoom(id string) *Room {
 	s.mu.Lock()
@@ -317,23 +425,25 @@ func (s *Server) dropIfEmpty(id string, room *Room) {
 	s.mu.Unlock()
 }
 
-// keepalive pings a websocket so idle NAT mappings do not expire silently.
+// keepalive proves a websocket is still usable, so idle NAT mappings do not
+// expire silently and a dead peer is not handed out as a live one.
 //
 // Without this, a connection through NAT can be dropped by the network with
 // neither side noticing: the peer never reads EOF, so the relay keeps handing
 // it out as a live agent and browsers pair with a corpse. The symptom is a room
 // that reports agents present while every browser waits forever.
-func keepalive(conn *websocket.Conn, done <-chan struct{}) {
-	const interval = 20 * time.Second
-	ticker := time.NewTicker(interval)
+func keepalive(conn *websocket.Conn, done <-chan struct{}, probe func() error) {
+	ticker := time.NewTicker(livenessCheckEvery)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-done:
 			return
 		case <-ticker.C:
-			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			if err := probe(); err != nil {
+				// Close rather than return: the reader then sees the error and
+				// runs the cleanup that frees the room slot.
+				_ = conn.Close()
 				return
 			}
 		}

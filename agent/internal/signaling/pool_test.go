@@ -284,3 +284,47 @@ func TestAgentRecycledToIdleWhenBrowserLeaves(t *testing.T) {
 	send(t, browser3, "offer-3")
 	expect(t, agent, "offer-3", "offer-3 forwarded to recycled agent on 3rd visit")
 }
+
+// A browser that gave up while queued must not be handed an agent slot.
+//
+// The outage this guards against (2026-11-01): browsers that had already closed
+// stayed in the waiting list. Every newly idle agent was handed to one of those
+// corpses, the write to it timed out, and the arriving browser was left waiting
+// forever — "answer timed out" in the page, "write tcp ... i/o timeout" in the
+// relay log, for 45 minutes.
+func TestDeadWaitingBrowserDoesNotHogTheAgent(t *testing.T) {
+	logger := log.New(os.Stderr, "[relay-test] ", log.LstdFlags)
+	srv := httptest.NewServer(signaling.NewServer(logger).Handler())
+	defer srv.Close()
+
+	// Two browsers arrive with no agent present: both are queued.
+	dead1 := dial(t, srv.URL, "corpse", "browser")
+	dead2 := dial(t, srv.URL, "corpse", "browser")
+	// The relay only notices a closed socket when it reads from it; the browser
+	// sends first, exactly like a page that offers and then gives up.
+	send(t, dead1, "offer-dead-1")
+	expect(t, dead1, `{"v":1,"type":"waiting"}`, "waiting frame for dead1")
+	send(t, dead2, "offer-dead-2")
+	expect(t, dead2, `{"v":1,"type":"waiting"}`, "waiting frame for dead2")
+
+	// The user gives up: both tabs close.
+	_ = dead1.Close()
+	_ = dead2.Close()
+	time.Sleep(300 * time.Millisecond)
+
+	// A live browser arrives and waits.
+	live := dial(t, srv.URL, "corpse", "browser")
+	defer func() { _ = live.Close() }()
+	send(t, live, "offer-live")
+	expect(t, live, `{"v":1,"type":"waiting"}`, "live browser waits for an agent")
+
+	// The agent finally dials a slot. It must serve the LIVE browser, not a corpse.
+	agent := dial(t, srv.URL, "corpse", "agent")
+	defer func() { _ = agent.Close() }()
+	send(t, live, "offer-live-again")
+	expect(t, agent, "offer-live-again", "live browser's offer forwarded to the new agent")
+
+	// And the answer comes back the same way.
+	send(t, agent, "answer-live")
+	expect(t, live, "answer-live", "answer delivered to the live browser")
+}
